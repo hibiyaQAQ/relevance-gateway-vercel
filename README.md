@@ -6,16 +6,18 @@
 > 使用本项目所涉及的上游账号、API Key、计费、风控、封禁、内容合规、数据安全及相关责任，均由实际使用者自行承担。  
 > 本项目与任何第三方服务提供商不存在官方关联，作者及贡献者不对因使用、部署或二次开发本项目所造成的任何直接或间接损失承担责任。
 
-一个把 Relevance AI Agent 暴露成 OpenAI 兼容接口的单端口网关项目。
+一个把 Relevance AI Agent 暴露成兼容接口的单端口网关项目。
 
-它同时提供：
+同时提供：
 
 - 管理后台：`/admin`
-- OpenAI 兼容 API：`/v1/models`、`/v1/chat/completions`
+- **OpenAI 兼容 API**：`/v1/models`、`/v1/chat/completions`
+- **Anthropic 兼容 API**：`/v1/messages`
 
 适合用来做：
 
 - 给 Cherry Studio、Open WebUI、AnythingLLM 一类客户端接入 Relevance AI
+- 给 **Claude Code** 提供 Anthropic 格式接入（支持工具调用）
 - 用一个统一入口管理上游 Project / Region / API Key
 - 通过后台快速部署、同步和调试可用模型
 
@@ -23,9 +25,9 @@
 
 `relevance-gateway-lab` 是一个基于 Node.js + Express + SQLite 的 Relevance AI 网关实验项目。
 
-它的核心目标是：把 Relevance AI 上游 Agent 包装成 OpenAI 风格的 API，同时提供一个轻量的后台，用来管理上游密钥、模型目录、部署记录、网关密钥和请求日志。
+核心目标：把 Relevance AI 上游 Agent 包装成 OpenAI / Anthropic 风格的 API，同时提供一个轻量后台，用来管理上游密钥、模型目录、部署记录、网关密钥和请求日志。
 
-当前运行时采用官方 `@relevanceai/sdk`，并对流式输出做了增强：
+运行时采用官方 `@relevanceai/sdk`，并做了以下增强：
 
 - 优先走 SDK / SSE 真流式
 - 断流或长时间静默时自动切到 `view` 轮询兜底
@@ -34,12 +36,13 @@
 ## 功能特性
 
 - 单端口服务，同时承载后台和 API
-- OpenAI 兼容接口，可直接对接支持 `chat/completions` 的客户端
+- **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`（流式 / 非流式）
+- **Anthropic 兼容**：`/v1/messages`（流式 / 非流式），适配 Claude Code
+- **工具调用（Tool Use）**：OpenAI `tools` / Anthropic `tools` 均支持，自动识别模型的工具调用意图并转换为标准格式
+- **图片输入（Multimodal）**：支持 HTTP URL 图片和 base64 内嵌图片，自动上传至 Relevance AI 临时存储
 - 后台管理上游 Relevance Key、模型目录、部署和网关 Key
 - 按模型维度管理 deployment，支持同步和批量部署
 - 请求日志落 SQLite，便于排查流式、成本、tokens 和失败原因
-- 官方 SDK 流式优先，`view` 轮询自动兜底
-- fallback 支持 `thinking` 与正文顺序控制，避免交错输出
 - Docker Compose 一键启动，本地调试成本低
 
 ## 快速开始
@@ -52,10 +55,9 @@
 cp .env.example .env
 ```
 
-如果只是本地试跑，默认值通常已经够用。至少建议改掉：
+至少建议改掉：
 
 - `APP_SECRET_KEY`
-- `APP_ENCRYPTION_KEY`
 - `ADMIN_USERNAME`
 - `ADMIN_PASSWORD`
 
@@ -70,27 +72,14 @@ docker compose up --build -d
 - 管理后台：`http://127.0.0.1:18080/admin`
 - API 根地址：`http://127.0.0.1:18080`
 
-### 3. 登录后台
-
-默认账号密码来自环境变量：
-
-- 用户名：`ADMIN_USERNAME`
-- 密码：`ADMIN_PASSWORD`
-
-如果你直接使用 `.env.example`，默认是：
-
-- 用户名：`admin`
-- 密码：`admin`
-
-### 4. 在后台完成初始化
+### 3. 在后台完成初始化
 
 建议按下面顺序操作：
 
 1. 添加一个上游 Relevance Key
 2. 刷新模型目录
-3. 为目标模型创建 deployment
+3. 为目标模型创建 deployment（`public_model_name` 就是客户端请求时用的模型名）
 4. 创建一个 Gateway API Key
-5. 用这个 Gateway API Key 请求 `/v1/models` 和 `/v1/chat/completions`
 
 ## 安装
 
@@ -103,8 +92,6 @@ docker compose up --build -d
 
 ### 本地运行
 
-如果你不想用 Docker，也可以直接本地运行：
-
 ```bash
 npm install
 npm --prefix frontend install
@@ -112,18 +99,9 @@ npm --prefix frontend run build
 node src/server.js
 ```
 
-默认本地地址：
+默认本地地址：`http://127.0.0.1:8080`
 
-```bash
-http://127.0.0.1:8080
-```
-
-注意：
-
-- 项目本身没有内置 `dotenv` 加载逻辑
-- 如果你本地直跑，需要自己导出环境变量
-
-例如：
+项目没有内置 `dotenv`，本地直跑需先导出环境变量：
 
 ```bash
 set -a
@@ -136,26 +114,9 @@ node src/server.js
 
 ### 管理后台
 
-后台相关接口和页面主要用于：
+入口：`/admin`，后台 API 前缀：`/admin-api/*`
 
-- 登录和退出
-- 管理上游 Relevance Key
-- 查看模型目录缓存
-- 创建、更新、删除 deployment
-- 创建、删除网关 API Key
-- 查看请求日志
-
-管理后台入口：
-
-```bash
-/admin
-```
-
-后台 API 前缀：
-
-```bash
-/admin-api/*
-```
+功能包括：登录/退出、管理上游 Relevance Key、查看模型目录缓存、管理 deployment、管理网关 API Key、查看请求日志。
 
 ### OpenAI 兼容 API
 
@@ -166,7 +127,7 @@ curl http://127.0.0.1:18080/v1/models \
   -H "Authorization: Bearer <YOUR_GATEWAY_KEY>"
 ```
 
-#### 发起非流式对话
+#### 对话（非流式）
 
 ```bash
 curl http://127.0.0.1:18080/v1/chat/completions \
@@ -181,7 +142,7 @@ curl http://127.0.0.1:18080/v1/chat/completions \
   }'
 ```
 
-#### 发起流式对话
+#### 对话（流式）
 
 ```bash
 curl -N http://127.0.0.1:18080/v1/chat/completions \
@@ -196,16 +157,163 @@ curl -N http://127.0.0.1:18080/v1/chat/completions \
   }'
 ```
 
+#### 工具调用
+
+请求中携带 `tools` 字段，网关会将工具定义注入上游 prompt，并在响应中自动识别模型的工具调用意图：
+
+```bash
+curl http://127.0.0.1:18080/v1/chat/completions \
+  -H "Authorization: Bearer <YOUR_GATEWAY_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "anthropic-claude-opus-4-6",
+    "messages": [{ "role": "user", "content": "查一下北京今天天气" }],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询城市天气",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" }
+          },
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+```
+
+#### 图片输入
+
+`image_url` 支持 HTTP URL 或 base64 data URL：
+
+```bash
+curl http://127.0.0.1:18080/v1/chat/completions \
+  -H "Authorization: Bearer <YOUR_GATEWAY_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "anthropic-claude-opus-4-6",
+    "messages": [{
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "这张图里有什么？" },
+        { "type": "image_url", "image_url": { "url": "https://example.com/image.jpg" } }
+      ]
+    }]
+  }'
+```
+
+### Anthropic 兼容 API
+
+网关同时暴露 `/v1/messages` 端点，格式与 Anthropic API 完全兼容。
+
+#### 对话（非流式）
+
+```bash
+curl http://127.0.0.1:18080/v1/messages \
+  -H "Authorization: Bearer <YOUR_GATEWAY_KEY>" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "anthropic-claude-opus-4-6",
+    "max_tokens": 1024,
+    "messages": [
+      { "role": "user", "content": "你好！" }
+    ]
+  }'
+```
+
+#### 对话（流式）
+
+```bash
+curl -N http://127.0.0.1:18080/v1/messages \
+  -H "Authorization: Bearer <YOUR_GATEWAY_KEY>" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "anthropic-claude-opus-4-6",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [
+      { "role": "user", "content": "请用中文写两段介绍 Node.js。" }
+    ]
+  }'
+```
+
+#### 工具调用
+
+```bash
+curl http://127.0.0.1:18080/v1/messages \
+  -H "Authorization: Bearer <YOUR_GATEWAY_KEY>" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "anthropic-claude-opus-4-6",
+    "max_tokens": 1024,
+    "tools": [{
+      "name": "get_weather",
+      "description": "查询城市天气",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": { "type": "string" }
+        },
+        "required": ["city"]
+      }
+    }],
+    "messages": [{ "role": "user", "content": "查一下北京今天天气" }]
+  }'
+```
+
+### 接入 Claude Code
+
+Claude Code 使用 Anthropic API 格式，可以直接将本网关作为后端。
+
+在 Claude Code 的配置中设置：
+
+```json
+{
+  "apiUrl": "http://your-gateway-host:18080",
+  "apiKey": "sk-gw-xxxxxx",
+  "model": "你在网关部署的 public_model_name"
+}
+```
+
+或通过环境变量：
+
+```bash
+export ANTHROPIC_BASE_URL=http://your-gateway-host:18080
+export ANTHROPIC_API_KEY=sk-gw-xxxxxx
+claude --model anthropic-claude-opus-4-6
+```
+
+`model` 字段填写你在网关后台创建 deployment 时设置的 `public_model_name`。
+
+Claude Code 的所有工具调用（文件读写、bash 执行等）都会经由 Relevance AI Agent 完整处理。
+
 ### 运行机制说明
 
-当前网关的执行路径大致如下：
-
-1. 接收 OpenAI 风格 `messages[]`
-2. 将整段对话编译成上游 transcript prompt
-3. 使用官方 `@relevanceai/sdk` 调用目标 Agent
-4. 优先消费 SDK / SSE 流式输出
-5. 如果上游长时间静默，则切到 `view` 轮询兜底
-6. 最终补齐 usage / cost / 最终文本并收尾
+```
+客户端请求
+  │
+  ├─ 解析消息（文本 / 图片 / tool_use / tool_result）
+  ├─ 图片 base64 → 上传至 Relevance AI 临时存储
+  ├─ 按最近最少使用策略选取 active deployment
+  ├─ 构建 transcript prompt（含工具定义、对话历史）
+  │
+  └─ runAgentTask（@relevanceai/sdk）
+       │
+       ├─ 优先 SSE 流式 ──────────────────────────────→ 逐 delta 输出
+       │   （无工具时直接转发，有工具时缓冲）
+       │
+       ├─ SSE 静默超阈值 → 切 view 轮询兜底 ──────────→ 平滑分块输出
+       │
+       └─ 任务结束 → waitForConversationResult
+            ├─ 检测工具调用 JSON → 返回 tool_use/tool_calls 响应
+            └─ 普通文本 → 补齐 usage / cost 后返回
+```
 
 ## 配置说明
 
@@ -254,22 +362,29 @@ SELF_TEST_UPSTREAM_API_KEY=... \
 python3 scripts/self_test.py
 ```
 
-适合用来验证：
-
-- 上游凭证是否可用
-- 模型触发是否成功
-- 网关基础链路是否正常
+适合用来验证上游凭证是否可用、模型触发是否成功、网关基础链路是否正常。
 
 ## 项目结构
 
-```bash
+```
 .
-├── src/                # Express 服务端、运行时、数据层
-├── frontend/           # 后台前端（React + Vite）
-├── static/             # 构建后的静态资源
-├── scripts/            # 自测和辅助脚本
-├── data/               # SQLite 数据库与运行数据
-├── docker-compose.yml  # Docker 启动配置
+├── src/
+│   ├── server.js           # Express 入口，所有路由（OpenAI + Anthropic + admin）
+│   ├── services.js         # 业务逻辑：CRUD、消息规范化、prompt 构建、deployment 选择
+│   ├── runtime.js          # Agent 任务执行引擎（SDK SSE + view 轮询兜底）
+│   ├── anthropic-format.js # Anthropic API 格式解析与响应构造
+│   ├── tools.js            # 工具调用：prompt 注入、响应检测
+│   ├── multimodal.js       # 图片处理：格式解析、base64 上传
+│   ├── relevance-rest.js   # Relevance AI REST API 轻量客户端
+│   ├── config.js           # 环境变量配置
+│   ├── db.js               # SQLite 初始化与 schema 管理
+│   ├── security.js         # admin session、gateway key 生成
+│   └── error-utils.js      # 错误序列化与分类
+├── frontend/               # 后台前端（React + Vite + Tailwind）
+├── static/                 # 构建后的静态资源
+├── scripts/                # 自测和辅助脚本
+├── data/                   # SQLite 数据库与运行数据
+├── docker-compose.yml
 └── README.md
 ```
 

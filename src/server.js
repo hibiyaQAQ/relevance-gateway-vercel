@@ -45,6 +45,13 @@ import {
   readBearerToken,
   verifyAdminCredentials,
 } from "./security.js";
+import { resolveImageAttachments } from "./multimodal.js";
+import { detectToolCall, normalizeTools, generateToolUseId } from "./tools.js";
+import {
+  parseAnthropicRequest,
+  buildAnthropicResponse,
+  createAnthropicStreamWriter,
+} from "./anthropic-format.js";
 
 const db = openDatabase(settings.databasePath);
 const app = express();
@@ -63,7 +70,11 @@ function requireAdmin(req, res) {
 }
 
 function requireGatewayKey(req, res) {
-  const rawKey = readBearerToken(req.headers.authorization);
+  // Support both "Authorization: Bearer <key>" (OpenAI style)
+  // and "x-api-key: <key>" (Anthropic style)
+  const rawKey =
+    readBearerToken(req.headers.authorization) ||
+    (req.headers["x-api-key"] ? String(req.headers["x-api-key"]).trim() : null);
   const gatewayKey = authenticateGatewayKey(db, rawKey);
   if (!gatewayKey) {
     res.status(401).json({ detail: "Invalid gateway API key." });
@@ -177,10 +188,40 @@ function parseChatRequest(body) {
     throw new Error("model is required.");
   }
   const normalizedMessages = normalizeMessages(body.messages);
+  const rawTools = body.tools;
+  const normalizedTools = rawTools ? normalizeTools(rawTools) : [];
+  const tools = normalizedTools.length ? normalizedTools : null;
   return {
     model: body.model.trim(),
     messages: normalizedMessages,
+    tools,
     stream: Boolean(body.stream),
+  };
+}
+
+function openaiToolCallPayload({ requestId, publicModelName, toolCallId, toolName, toolInput, usage }) {
+  return {
+    id: requestId,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: publicModelName,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: toolCallId,
+          type: "function",
+          function: {
+            name: toolName,
+            arguments: JSON.stringify(toolInput),
+          },
+        }],
+      },
+      finish_reason: "tool_calls",
+    }],
+    usage,
   };
 }
 
@@ -528,7 +569,27 @@ app.post("/v1/chat/completions", async (req, res) => {
     });
   }
 
-  const prompt = buildPrompt(chatRequest.messages);
+  const material = {
+    project: deployment.project,
+    region: deployment.region,
+    apiKey: deployment.api_key,
+  };
+
+  // Resolve any image attachments (upload base64 → Relevance AI temp storage)
+  let resolvedMessages = chatRequest.messages;
+  let imageAttachments = [];
+  try {
+    const resolved = await resolveImageAttachments(chatRequest.messages, material);
+    resolvedMessages = resolved.messages;
+    imageAttachments = resolved.attachments;
+  } catch (error) {
+    return errorResponse(res, {
+      message: `Failed to process image attachments: ${error.message || error}`,
+      code: "invalid_request",
+    });
+  }
+
+  const prompt = buildPrompt(resolvedMessages, { tools: chatRequest.tools });
   const requestId = beginGatewayRequest(db, {
     deployment,
     gatewayKeyName: gatewayKey.name,
@@ -683,25 +744,35 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     });
 
+    // When tools are present we buffer all output — we must see the full response
+    // before knowing whether the agent is making a tool call.
+    const hasTool = Boolean(chatRequest.tools && chatRequest.tools.length);
+    const toolNames = hasTool ? chatRequest.tools.map((t) => t.name) : null;
+
     res.set({
       ...deploymentHeaders(deployment),
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       "Content-Type": "text/event-stream; charset=utf-8",
-      "x-gateway-mode": "agent-sdk-stream",
+      "x-gateway-mode": hasTool ? "agent-sdk-stream-buffered" : "agent-sdk-stream",
       "x-gateway-request-id": requestId,
     });
     res.flushHeaders?.();
-    writeSse(
-      "assistant_role",
-      sseData(
-        openaiChunkPayload({
-          requestId,
-          publicModelName: deployment.public_model_name,
-          delta: { role: "assistant" },
-        }),
-      ),
-    );
+
+    // Only emit the opening role chunk immediately when NOT buffering for tools.
+    // When tools are present we'll emit everything after the full response is known.
+    if (!hasTool) {
+      writeSse(
+        "assistant_role",
+        sseData(
+          openaiChunkPayload({
+            requestId,
+            publicModelName: deployment.public_model_name,
+            delta: { role: "assistant" },
+          }),
+        ),
+      );
+    }
 
     markRequestStreaming(db, requestId);
 
@@ -715,20 +786,19 @@ app.post("/v1/chat/completions", async (req, res) => {
     try {
       const result = await runAgentTask({
         requestId,
-        material: {
-          project: deployment.project,
-          region: deployment.region,
-          apiKey: deployment.api_key,
-        },
+        material,
         agentId: deployment.agent_id,
         prompt,
+        attachments: imageAttachments,
         timeoutSeconds: settings.upstreamPollTimeoutSeconds,
         abortSignal: abortController.signal,
         onTaskCreated: (conversationId) => {
           upstreamConversationId = conversationId;
           markRequestStreaming(db, requestId, conversationId);
         },
-        onThinking: (delta) => {
+        // When tools are present, suppress progressive streaming so we can inspect
+        // the full response for tool-call JSON before emitting anything.
+        onThinking: hasTool ? null : (delta) => {
           if (closed || !delta) return;
           markUpstreamDelta("thinking", delta);
           writeSse(
@@ -743,7 +813,7 @@ app.post("/v1/chat/completions", async (req, res) => {
             { delta_chars: delta.length },
           );
         },
-        onText: (delta) => {
+        onText: hasTool ? null : (delta) => {
           if (closed || !delta) return;
           markUpstreamDelta("text", delta);
           writeSse(
@@ -800,26 +870,95 @@ app.post("/v1/chat/completions", async (req, res) => {
       );
 
       if (!closed) {
-        console.info(
-          "stream request finishing request_id=%s conversation_id=%s remaining_fallback_content_chars=%s remaining_fallback_thinking_chars=%s final_content_chars=%s final_thinking_chars=%s",
-          requestId,
-          result.conversationId || upstreamConversationId,
-          result.remainingFallbackContentChars,
-          result.remainingFallbackThinkingChars,
-          result.finalContentChars,
-          result.finalThinkingChars,
-        );
-        writeSse(
-          "finish_chunk",
-          sseData(
-            openaiChunkPayload({
+        if (hasTool) {
+          // Emit all buffered content now that we know the full response
+          const toolCall = detectToolCall(result.content, toolNames);
+          if (toolCall) {
+            const toolCallId = generateToolUseId();
+            // 1. role chunk
+            writeSse("assistant_role", sseData(openaiChunkPayload({
+              requestId,
+              publicModelName: deployment.public_model_name,
+              delta: { role: "assistant", content: null },
+            })));
+            // 2. tool_call identity chunk
+            writeSse("tool_call_init", sseData(openaiChunkPayload({
+              requestId,
+              publicModelName: deployment.public_model_name,
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  id: toolCallId,
+                  type: "function",
+                  function: { name: toolCall.name, arguments: "" },
+                }],
+              },
+            })));
+            // 3. arguments chunk
+            writeSse("tool_call_args", sseData(openaiChunkPayload({
+              requestId,
+              publicModelName: deployment.public_model_name,
+              delta: {
+                tool_calls: [{ index: 0, function: { arguments: JSON.stringify(toolCall.input) } }],
+              },
+            })));
+            // 4. finish
+            writeSse("finish_chunk", sseData(openaiChunkPayload({
+              requestId,
+              publicModelName: deployment.public_model_name,
+              delta: {},
+              finishReason: "tool_calls",
+            })));
+          } else {
+            // No tool call — emit the buffered text as a single stream of chunks
+            writeSse("assistant_role", sseData(openaiChunkPayload({
+              requestId,
+              publicModelName: deployment.public_model_name,
+              delta: { role: "assistant" },
+            })));
+            if (result.thinking) {
+              writeSse("thinking_delta", sseData(openaiChunkPayload({
+                requestId,
+                publicModelName: deployment.public_model_name,
+                delta: { reasoning_content: result.thinking, thinking: result.thinking },
+              })));
+            }
+            if (result.content) {
+              writeSse("content_delta", sseData(openaiChunkPayload({
+                requestId,
+                publicModelName: deployment.public_model_name,
+                delta: { content: result.content },
+              })));
+            }
+            writeSse("finish_chunk", sseData(openaiChunkPayload({
               requestId,
               publicModelName: deployment.public_model_name,
               delta: {},
               finishReason: "stop",
-            }),
-          ),
-        );
+            })));
+          }
+        } else {
+          console.info(
+            "stream request finishing request_id=%s conversation_id=%s remaining_fallback_content_chars=%s remaining_fallback_thinking_chars=%s final_content_chars=%s final_thinking_chars=%s",
+            requestId,
+            result.conversationId || upstreamConversationId,
+            result.remainingFallbackContentChars,
+            result.remainingFallbackThinkingChars,
+            result.finalContentChars,
+            result.finalThinkingChars,
+          );
+          writeSse(
+            "finish_chunk",
+            sseData(
+              openaiChunkPayload({
+                requestId,
+                publicModelName: deployment.public_model_name,
+                delta: {},
+                finishReason: "stop",
+              }),
+            ),
+          );
+        }
         writeSse("done", "data: [DONE]\n\n");
         res.end();
       }
@@ -848,17 +987,16 @@ app.post("/v1/chat/completions", async (req, res) => {
     return;
   }
 
+  const hasTool = Boolean(chatRequest.tools && chatRequest.tools.length);
+  const toolNames = hasTool ? chatRequest.tools.map((t) => t.name) : null;
   let upstreamConversationId = null;
   try {
     const result = await runAgentTask({
       requestId,
-      material: {
-        project: deployment.project,
-        region: deployment.region,
-        apiKey: deployment.api_key,
-      },
+      material,
       agentId: deployment.agent_id,
       prompt,
+      attachments: imageAttachments,
       timeoutSeconds: settings.upstreamPollTimeoutSeconds,
       onTaskCreated: (conversationId) => {
         upstreamConversationId = conversationId;
@@ -896,24 +1034,40 @@ app.post("/v1/chat/completions", async (req, res) => {
       result.finalTailThinkingChars,
     );
 
-    return res
-      .set({
-        ...deploymentHeaders(deployment),
-        "x-gateway-mode": "agent-sdk-aggregated",
-        "x-gateway-request-id": requestId,
-        ...(result.conversationId
-          ? { "x-upstream-conversation-id": result.conversationId }
-          : {}),
-      })
-      .json(
-        openaiCompletionPayload({
-          requestId,
-          publicModelName: deployment.public_model_name,
-          content: result.content,
-          thinking: result.thinking,
-          usage: result.usage,
-        }),
-      );
+    const responseHeaders = {
+      ...deploymentHeaders(deployment),
+      "x-gateway-mode": "agent-sdk-aggregated",
+      "x-gateway-request-id": requestId,
+      ...(result.conversationId ? { "x-upstream-conversation-id": result.conversationId } : {}),
+    };
+
+    // Detect tool call in the response when tools were provided
+    if (hasTool) {
+      const toolCall = detectToolCall(result.content, toolNames);
+      if (toolCall) {
+        const toolCallId = generateToolUseId();
+        return res.set(responseHeaders).json(
+          openaiToolCallPayload({
+            requestId,
+            publicModelName: deployment.public_model_name,
+            toolCallId,
+            toolName: toolCall.name,
+            toolInput: toolCall.input,
+            usage: result.usage,
+          }),
+        );
+      }
+    }
+
+    return res.set(responseHeaders).json(
+      openaiCompletionPayload({
+        requestId,
+        publicModelName: deployment.public_model_name,
+        content: result.content,
+        thinking: result.thinking,
+        usage: result.usage,
+      }),
+    );
   } catch (error) {
     failGatewayRequest(db, {
       requestId,
@@ -933,6 +1087,301 @@ app.post("/v1/chat/completions", async (req, res) => {
       code: "upstream_error",
       statusCode: 502,
       headers: deploymentHeaders(deployment),
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Anthropic Messages API  (/v1/messages)
+// ---------------------------------------------------------------------------
+
+app.post("/v1/messages", async (req, res) => {
+  const gatewayKey = requireGatewayKey(req, res);
+  if (!gatewayKey) return;
+
+  let anthropicReq;
+  try {
+    anthropicReq = parseAnthropicRequest(req.body);
+  } catch (error) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: String(error.message || error) },
+    });
+  }
+
+  const deployment = selectDeploymentForModel(db, anthropicReq.model);
+  if (!deployment) {
+    return res.status(503).json({
+      type: "error",
+      error: {
+        type: "overloaded_error",
+        message: `No active deployment is available for model '${anthropicReq.model}'.`,
+      },
+    });
+  }
+
+  const material = {
+    project: deployment.project,
+    region: deployment.region,
+    apiKey: deployment.api_key,
+  };
+
+  // Resolve image attachments
+  let resolvedMessages = anthropicReq.messages;
+  let imageAttachments = [];
+  try {
+    const resolved = await resolveImageAttachments(anthropicReq.messages, material);
+    resolvedMessages = resolved.messages;
+    imageAttachments = resolved.attachments;
+  } catch (error) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: `Image processing failed: ${error.message || error}` },
+    });
+  }
+
+  const prompt = buildPrompt(resolvedMessages, {
+    tools: anthropicReq.tools,
+    systemPrompt: anthropicReq.systemPrompt,
+  });
+  const requestId = beginGatewayRequest(db, {
+    deployment,
+    gatewayKeyName: gatewayKey.name,
+    stream: anthropicReq.stream,
+    prompt,
+  });
+
+  const toolNames = anthropicReq.tools ? anthropicReq.tools.map((t) => t.name) : null;
+  const hasTool = Boolean(toolNames && toolNames.length);
+
+  // ------------------------------------------------------------------
+  // Streaming path
+  // ------------------------------------------------------------------
+  if (anthropicReq.stream) {
+    const abortController = new AbortController();
+    let closed = false;
+    let upstreamConversationId = null;
+
+    req.on("aborted", () => {
+      if (closed) return;
+      closed = true;
+      abortController.abort();
+    });
+
+    res.set({
+      "x-upstream-agent-id": deployment.agent_id,
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "x-gateway-mode": hasTool ? "anthropic-stream-buffered" : "anthropic-stream",
+      "x-gateway-request-id": requestId,
+      "anthropic-version": "2023-06-01",
+    });
+    res.flushHeaders?.();
+
+    markRequestStreaming(db, requestId);
+
+    const writer = createAnthropicStreamWriter(res, requestId, anthropicReq.model, 0);
+
+    const heartbeat = setInterval(() => {
+      if (!closed) writer.ping();
+    }, settings.streamHeartbeatIntervalSeconds * 1000);
+
+    // For progressive streaming (no tools), track open blocks
+    let blockIndex = 0;
+    let thinkingBlockHandle = null; // open thinking block
+    let textBlockHandle = null;     // open text block
+
+    try {
+      const result = await runAgentTask({
+        requestId,
+        material,
+        agentId: deployment.agent_id,
+        prompt,
+        attachments: imageAttachments,
+        timeoutSeconds: settings.upstreamPollTimeoutSeconds,
+        abortSignal: abortController.signal,
+        onTaskCreated: (conversationId) => {
+          upstreamConversationId = conversationId;
+          markRequestStreaming(db, requestId, conversationId);
+        },
+        onThinking: hasTool ? null : (delta) => {
+          if (writer.closed() || !delta) return;
+          if (!thinkingBlockHandle) {
+            thinkingBlockHandle = writer.openThinkingBlock(blockIndex);
+          }
+          thinkingBlockHandle.delta(delta);
+        },
+        onText: hasTool ? null : (delta) => {
+          if (writer.closed() || !delta) return;
+          if (!textBlockHandle) {
+            // Close thinking block before opening text block
+            if (thinkingBlockHandle) {
+              thinkingBlockHandle.close();
+              thinkingBlockHandle = null;
+              blockIndex++;
+            }
+            textBlockHandle = writer.openTextBlock(blockIndex);
+          }
+          textBlockHandle.delta(delta);
+        },
+      });
+
+      clearInterval(heartbeat);
+
+      completeGatewayRequest(db, {
+        requestId,
+        deploymentId: deployment.id,
+        conversationId: result.conversationId || upstreamConversationId,
+        usage: result.usage,
+        latencyMs: result.latencyMs,
+        firstTokenMs: result.firstTokenMs,
+        cost: result.cost,
+        creditsUsed: result.creditsUsed,
+        transport: result.transport,
+        content: result.content,
+        thinking: result.thinking,
+        emittedContentChars: result.emittedContentChars,
+        emittedThinkingChars: result.emittedThinkingChars,
+      });
+
+      if (!writer.closed()) {
+        if (hasTool) {
+          // Buffered mode — emit everything now that we have the full response
+          const toolCall = detectToolCall(result.content, toolNames);
+          let idx = 0;
+          if (result.thinking) {
+            writer.emitThinkingBlock(result.thinking, idx++);
+          }
+          if (toolCall) {
+            const toolCallId = generateToolUseId();
+            writer.emitToolUseBlock(toolCallId, toolCall.name, toolCall.input, idx++);
+            writer.finish("tool_use", result.usage?.completion_tokens || 0);
+          } else {
+            const tb = writer.openTextBlock(idx++);
+            if (result.content) tb.delta(result.content);
+            tb.close();
+            writer.finish("end_turn", result.usage?.completion_tokens || 0);
+          }
+        } else {
+          // Progressive mode — close any open blocks and finish
+          if (thinkingBlockHandle) {
+            thinkingBlockHandle.close();
+            thinkingBlockHandle = null;
+            blockIndex++;
+          }
+          if (textBlockHandle) {
+            textBlockHandle.close();
+            textBlockHandle = null;
+          } else {
+            // Nothing was emitted — emit empty text block so the message is valid
+            const tb = writer.openTextBlock(blockIndex);
+            tb.close();
+          }
+          writer.finish("end_turn", result.usage?.completion_tokens || 0);
+        }
+      }
+    } catch (error) {
+      clearInterval(heartbeat);
+      failGatewayRequest(db, {
+        requestId,
+        deploymentId: deployment.id,
+        conversationId: upstreamConversationId,
+        transport: "sdk-task-runtime",
+        errorMessage: String(error.message || error),
+      });
+      console.error(
+        "anthropic stream failed request_id=%s error=%s",
+        requestId,
+        formatErrorForLog(error),
+      );
+      if (!writer.closed()) {
+        writer.error(String(error.message || error));
+      }
+    }
+    return;
+  }
+
+  // ------------------------------------------------------------------
+  // Non-streaming path
+  // ------------------------------------------------------------------
+  let upstreamConversationId = null;
+  try {
+    const result = await runAgentTask({
+      requestId,
+      material,
+      agentId: deployment.agent_id,
+      prompt,
+      attachments: imageAttachments,
+      timeoutSeconds: settings.upstreamPollTimeoutSeconds,
+      onTaskCreated: (conversationId) => {
+        upstreamConversationId = conversationId;
+      },
+    });
+
+    completeGatewayRequest(db, {
+      requestId,
+      deploymentId: deployment.id,
+      conversationId: result.conversationId || upstreamConversationId,
+      usage: result.usage,
+      latencyMs: result.latencyMs,
+      firstTokenMs: result.firstTokenMs,
+      cost: result.cost,
+      creditsUsed: result.creditsUsed,
+      transport: result.transport,
+      content: result.content,
+      thinking: result.thinking,
+      emittedContentChars: result.emittedContentChars,
+      emittedThinkingChars: result.emittedThinkingChars,
+    });
+
+    console.info(
+      "anthropic request completed request_id=%s conversation_id=%s latency_ms=%s",
+      requestId,
+      result.conversationId || upstreamConversationId,
+      result.latencyMs,
+    );
+
+    const toolCall = hasTool ? detectToolCall(result.content, toolNames) : null;
+    const toolCallId = toolCall ? generateToolUseId() : null;
+
+    return res
+      .set({
+        "x-upstream-agent-id": deployment.agent_id,
+        "x-gateway-request-id": requestId,
+        "x-gateway-mode": "anthropic-aggregated",
+        "anthropic-version": "2023-06-01",
+      })
+      .json(
+        buildAnthropicResponse({
+          requestId,
+          model: anthropicReq.model,
+          content: result.content,
+          thinking: result.thinking,
+          toolCall,
+          toolCallId,
+          usage: result.usage,
+        }),
+      );
+  } catch (error) {
+    failGatewayRequest(db, {
+      requestId,
+      deploymentId: deployment.id,
+      conversationId: upstreamConversationId,
+      transport: "sdk-task-runtime",
+      errorMessage: String(error.message || error),
+    });
+    console.error(
+      "anthropic request failed request_id=%s error=%s",
+      requestId,
+      formatErrorForLog(error),
+    );
+    return res.status(502).json({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: `Upstream request failed: ${error.message || error}`,
+      },
     });
   }
 });

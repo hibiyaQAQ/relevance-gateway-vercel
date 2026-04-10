@@ -8,6 +8,7 @@ import {
   extractAnswerAndUsage,
   extractCostAndCredits,
   extractTaskViewProgress,
+  unwrapStructuredAnswerText,
 } from "./relevance-rest.js";
 import { classifyError, serializeError } from "./error-utils.js";
 
@@ -221,6 +222,7 @@ export async function runAgentTask({
   material,
   agentId,
   prompt,
+  attachments,
   timeoutSeconds,
   abortSignal,
   onTaskCreated,
@@ -289,7 +291,9 @@ export async function runAgentTask({
   const sendMessageStartedAt = Date.now();
   let task;
   try {
-    task = await agent.sendMessage(prompt);
+    // attachments: [{ fileName, fileUrl }] — for image blocks resolved to Relevance AI URLs
+    const fileAttachments = Array.isArray(attachments) && attachments.length ? attachments : [];
+    task = await agent.sendMessage(prompt, fileAttachments);
     emitTaskCreated(task.id, taskState, onTaskCreated);
     logRuntime("info", "send_message_completed", {
       request_id: requestId,
@@ -739,7 +743,7 @@ export async function runAgentTask({
           throw new RelevanceError(`Upstream task ${task.id} failed.`);
         }
 
-        let finalContent = finalMessageText || emittedContent;
+        let finalContent = unwrapStructuredAnswerText(finalMessageText || emittedContent);
         let finalThinking = emittedThinking;
         let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
         let cost = null;
@@ -753,11 +757,26 @@ export async function runAgentTask({
           );
           const answerAndUsage = extractAnswerAndUsage(studioResult);
           const costAndCredits = extractCostAndCredits(studioResult);
-          if (
-            answerAndUsage.answer &&
-            answerAndUsage.answer.length >= (finalContent || "").length
-          ) {
-            finalContent = answerAndUsage.answer;
+          if (answerAndUsage.answer) {
+            // Always prefer the extracted answer if the current content looks like
+            // a raw JSON blob (Relevance AI sometimes returns the full output_preview
+            // JSON as message.text, which is much longer than the clean answer).
+            // Otherwise, only replace if the extracted answer is at least as long
+            // (guards against a truncated result overwriting good streamed content).
+            const currentLooksLikeJson =
+              typeof finalContent === "string" &&
+              (finalContent.trimStart().startsWith("{") ||
+                finalContent.trimStart().startsWith("["));
+            if (
+              currentLooksLikeJson ||
+              answerAndUsage.answer.length >= (finalContent || "").length
+            ) {
+              finalContent = answerAndUsage.answer;
+            }
+          }
+          // Use thinking from the conversation result if the SDK stream didn't yield any
+          if (!finalThinking && answerAndUsage.thinking) {
+            finalThinking = answerAndUsage.thinking;
           }
           usage = answerAndUsage.usage;
           cost = costAndCredits.cost;
@@ -774,8 +793,17 @@ export async function runAgentTask({
           const viewPayload = await pollClient.getTaskView(agentId, task.id).catch(() => null);
           if (viewPayload) {
             const progress = extractTaskViewProgress(viewPayload);
-            if (progress.text && progress.text.length >= (finalContent || "").length) {
-              finalContent = progress.text;
+            if (progress.text) {
+              const currentLooksLikeJson =
+                typeof finalContent === "string" &&
+                (finalContent.trimStart().startsWith("{") ||
+                  finalContent.trimStart().startsWith("["));
+              if (
+                currentLooksLikeJson ||
+                progress.text.length >= (finalContent || "").length
+              ) {
+                finalContent = progress.text;
+              }
             }
             if (progress.thinking && progress.thinking.length >= (finalThinking || "").length) {
               finalThinking = progress.thinking;

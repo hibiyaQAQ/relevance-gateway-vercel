@@ -4,6 +4,8 @@ import { settings } from "./config.js";
 import { nowUtc, normalizeBool, parseJson } from "./db.js";
 import { RelevanceError, RelevanceRestClient, extractCostAndCredits } from "./relevance-rest.js";
 import { generateGatewayKey } from "./security.js";
+import { parseOpenAIImageUrl } from "./multimodal.js";
+import { buildToolsSection, generateToolUseId } from "./tools.js";
 
 const DEPLOYMENT_FIELDS = ["public_model_name", "display_name", "upstream_model"];
 
@@ -203,55 +205,161 @@ export function buildPaginatedResponse(items, total, page, pageSize) {
   };
 }
 
-export function normalizeMessageContent(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((item) => {
-        if (!item || typeof item !== "object") {
-          throw new Error("Only text content blocks are supported.");
-        }
-        if (item.type !== "text" || typeof item.text !== "string") {
-          throw new Error("Only text content blocks are supported.");
-        }
-        return item.text;
-      })
-      .join("");
+/**
+ * Normalize a single OpenAI content block to our internal format.
+ * Internal block types: text | image_pending | tool_use | tool_result
+ */
+function normalizeOpenAIBlock(block) {
+  if (!block || typeof block !== "object") throw new Error("Content block must be an object.");
+  switch (block.type) {
+    case "text":
+      return { type: "text", text: String(block.text || "") };
+    case "image_url":
+      return parseOpenAIImageUrl(block.image_url);
+    default:
+      throw new Error(`Unsupported content block type: "${block.type}"`);
   }
-  throw new Error("Message content must be a string or an array of text blocks.");
 }
 
+/**
+ * Normalize OpenAI message content (string or array) to an array of internal blocks.
+ */
+export function normalizeMessageContent(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (Array.isArray(content)) return content.map(normalizeOpenAIBlock);
+  throw new Error("Message content must be a string or array of content blocks.");
+}
+
+/**
+ * Normalize OpenAI messages array to internal format.
+ *
+ * Handles special OpenAI roles:
+ *  - "tool"      → converted to a user message with a tool_result block
+ *  - "assistant" with tool_calls → content blocks include tool_use entries
+ */
 export function normalizeMessages(messages) {
   if (!Array.isArray(messages) || !messages.length) {
     throw new Error("messages must be a non-empty array.");
   }
   return messages.map((item) => {
-    if (!item || typeof item !== "object") {
-      throw new Error("Each message must be an object.");
+    if (!item || typeof item !== "object") throw new Error("Each message must be an object.");
+    const role = String(item.role || "").trim();
+    if (!role) throw new Error("Each message must include a role.");
+
+    // OpenAI "tool" role → user message with tool_result block
+    if (role === "tool") {
+      return {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          toolUseId: String(item.tool_call_id || ""),
+          content: typeof item.content === "string"
+            ? item.content
+            : JSON.stringify(item.content),
+          isError: false,
+        }],
+      };
     }
-    if (typeof item.role !== "string" || !item.role.trim()) {
-      throw new Error("Each message must include a role.");
+
+    // OpenAI assistant message with tool_calls (and possibly null content)
+    if (role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length) {
+      const blocks = [];
+      if (item.content) {
+        blocks.push({ type: "text", text: String(item.content) });
+      }
+      for (const tc of item.tool_calls) {
+        let input = {};
+        try {
+          input = JSON.parse(tc.function?.arguments || "{}");
+        } catch { /* ignore */ }
+        blocks.push({
+          type: "tool_use",
+          id: String(tc.id || generateToolUseId()),
+          name: String(tc.function?.name || ""),
+          input,
+        });
+      }
+      return { role: "assistant", content: blocks };
     }
-    return {
-      role: item.role.trim(),
-      content: normalizeMessageContent(item.content),
-    };
+
+    return { role, content: normalizeMessageContent(item.content) };
   });
 }
 
-export function buildPrompt(messages) {
+/**
+ * Render an array of internal content blocks to a text string for the transcript.
+ */
+function renderContentBlocks(blocks) {
+  const parts = [];
+  for (const block of blocks) {
+    switch (block.type) {
+      case "text":
+        if (block.text) parts.push(block.text);
+        break;
+      case "thinking":
+      case "redacted_thinking":
+        break;
+      case "image":
+        parts.push(`[Image attachment: ${block.fileName || "image"}]`);
+        break;
+      case "image_pending":
+        parts.push(`[Image: ${block.fileName || "image"}]`);
+        break;
+      case "tool_use":
+        parts.push(
+          `<tool_call id="${block.id}">\n${JSON.stringify({ tool: block.name, input: block.input })}\n</tool_call>`,
+        );
+        break;
+      case "tool_result": {
+        const errAttr = block.isError ? ' is_error="true"' : "";
+        parts.push(
+          `<tool_result tool_use_id="${block.toolUseId}"${errAttr}>\n${block.content}\n</tool_result>`,
+        );
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Build the text prompt to send to the Relevance AI agent.
+ *
+ * @param {Array} messages       - normalized internal messages
+ * @param {object} [options]
+ * @param {Array|null}  [options.tools]        - normalized tool definitions
+ * @param {string|null} [options.systemPrompt] - extra system text (Anthropic "system" field)
+ */
+export function buildPrompt(messages, { tools = null, systemPrompt = null } = {}) {
   const lines = [
     "<System>",
     "Treat the transcript below as the full conversation context from the gateway.",
     "Answer the final user message directly and naturally.",
-    "</System>",
-    "",
-    "<Transcript>",
   ];
+  if (systemPrompt) {
+    lines.push("");
+    lines.push(systemPrompt);
+  }
+  lines.push("</System>");
+  lines.push("");
+
+  if (tools && tools.length) {
+    lines.push(buildToolsSection(tools));
+    lines.push("");
+  }
+
+  lines.push("<Transcript>");
 
   for (const item of messages) {
+    if (item.role === "system") continue; // system is handled above
     lines.push(`[${item.role}]`);
-    lines.push(item.content);
+    if (typeof item.content === "string") {
+      lines.push(item.content);
+    } else if (Array.isArray(item.content)) {
+      lines.push(renderContentBlocks(item.content));
+    }
     lines.push(`[/${item.role}]`);
     lines.push("");
   }

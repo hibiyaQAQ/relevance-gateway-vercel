@@ -15,6 +15,7 @@
     "react-dom": "^18.2.0",
     "react-router-dom": "^7.14.0",
     "recharts": "^2.15.1",
+    "relevance-gateway-lab": "file:..",
     "tailwind-merge": "^2.2.2"
   },
   "devDependencies": {

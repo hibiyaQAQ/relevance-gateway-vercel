@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s https://docs.anthropic.com/en/api/messages)",
+      "Bash(curl -s -L --max-time 30 \"https://relevanceai.com/docs/get-started/core-concepts/agents\")",
+      "Bash(curl -s https://docs.anthropic.com/en/api/messages-streaming)",
+      "Bash(curl -s -L --max-time 30 \"https://relevanceai.com/docs/agent/api\")",
+      "Bash(curl -s -L --max-time 30 \"https://relevanceai.com/docs/build/tool-steps/llms/text\")",
+      "Bash(curl -s -L --max-time 30 \"https://relevanceai.com/docs/build/tool-steps/llms/multimodal\")",
+      "WebFetch(domain:relevanceai.com)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:sdk.relevanceai.com)",
+      "Bash(node:*)",
+      "Bash(npm install:*)",
+      "Bash(APP_SECRET_KEY=test ADMIN_USERNAME=admin ADMIN_PASSWORD=admin PORT=18099 node src/server.js)",
+      "Bash(curl -s -X POST http://127.0.0.1:18099/v1/messages -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-gw-invalid' -d '{\"model\":\"test\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:18099/v1/messages -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-gw-invalid' -d '{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}')",
+      "Bash(APP_SECRET_KEY=test ADMIN_USERNAME=admin ADMIN_PASSWORD=admin PORT=18099 timeout 5 node src/server.js)",
+      "Bash(APP_SECRET_KEY=test ADMIN_USERNAME=admin ADMIN_PASSWORD=admin PORT=18099 timeout 4 node src/server.js)",
+      "Bash(curl -s http://127.0.0.1:8080/v1/models -H 'Authorization: Bearer sk-gw--k75VCp5tR9-f0cLkpWcV5t0iLvBYs0i')",
+      "Bash(curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Authorization: Bearer sk-gw--k75VCp5tR9-f0cLkpWcV5t0iLvBYs0i' -H 'Content-Type: application/json' -d '{:*)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(grep -v \"^$\")",
+      "Bash(netstat -ano)",
+      "Bash(APP_SECRET_KEY=test ADMIN_USERNAME=admin ADMIN_PASSWORD=admin PORT=18100 DEBUG_RUNTIME=true node src/server.js)"
+    ]
+  }
+}

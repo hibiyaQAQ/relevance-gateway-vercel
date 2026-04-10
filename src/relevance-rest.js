@@ -157,35 +157,276 @@ export class RelevanceRestClient {
   }
 }
 
-export function extractAnswerAndUsage(studioResult) {
-  const preview = studioResult?.output_preview || {};
-  let answer = preview.answer || "";
+const RESULT_TEXT_FIELDS = ["answer", "text", "content"];
 
-  if (!answer && preview.message) {
-    try {
-      answer = JSON.parse(preview.message).answer || preview.message;
-    } catch {
-      answer = preview.message;
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function decodeJsonishString(rawValue) {
+  let decoded = "";
+  for (let index = 0; index < rawValue.length; index += 1) {
+    const char = rawValue[index];
+    if (char !== "\\") {
+      decoded += char;
+      continue;
+    }
+
+    const next = rawValue[index + 1];
+    if (next == null) {
+      decoded += "\\";
+      break;
+    }
+
+    switch (next) {
+      case "\"":
+        decoded += "\"";
+        break;
+      case "\\":
+        decoded += "\\";
+        break;
+      case "/":
+        decoded += "/";
+        break;
+      case "b":
+        decoded += "\b";
+        break;
+      case "f":
+        decoded += "\f";
+        break;
+      case "n":
+        decoded += "\n";
+        break;
+      case "r":
+        decoded += "\r";
+        break;
+      case "t":
+        decoded += "\t";
+        break;
+      case "u": {
+        const hex = rawValue.slice(index + 2, index + 6);
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          decoded += String.fromCharCode(Number.parseInt(hex, 16));
+          index += 4;
+        } else {
+          decoded += "u";
+        }
+        break;
+      }
+      default:
+        decoded += next;
+        break;
+    }
+
+    index += 1;
+  }
+  return decoded;
+}
+
+function extractNamedJsonishStringField(text, fieldName) {
+  const matcher = new RegExp(`"${escapeRegExp(fieldName)}"\\s*:\\s*"`, "g");
+  let match;
+  while ((match = matcher.exec(text)) !== null) {
+    let index = matcher.lastIndex;
+    let rawValue = "";
+    while (index < text.length) {
+      const char = text[index];
+      if (char === "\\") {
+        rawValue += char;
+        index += 1;
+        if (index < text.length) {
+          rawValue += text[index];
+          index += 1;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        return decodeJsonishString(rawValue);
+      }
+      rawValue += char;
+      index += 1;
+    }
+  }
+  return null;
+}
+
+export function unwrapStructuredAnswerText(text) {
+  if (typeof text !== "string" || !text) return "";
+
+  const trimmed = text.trimStart();
+  const looksStructured =
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("[") ||
+    /"(answer|text|content)"\s*:/.test(trimmed.slice(0, 240));
+  if (!looksStructured) {
+    return text;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const fieldName of RESULT_TEXT_FIELDS) {
+        if (typeof parsed[fieldName] === "string") {
+          return parsed[fieldName];
+        }
+      }
+    }
+  } catch {}
+
+  for (const fieldName of RESULT_TEXT_FIELDS) {
+    const extracted = extractNamedJsonishStringField(trimmed, fieldName);
+    if (typeof extracted === "string") {
+      return extracted;
     }
   }
 
+  return text;
+}
+
+/**
+ * Extract the answer text and token usage from a Relevance AI conversation result.
+ *
+ * The `conversations/studios/list` API can return the payload at different levels
+ * depending on the agent/model configuration:
+ *
+ *   A) studioResult.answer                        ← top-level (observed with Claude models)
+ *   B) studioResult.output_preview.answer         ← nested in output_preview
+ *   C) studioResult.output_preview.message        ← JSON string {"text":"...","thinking":[...]}
+ *   D) studioResult.validation_history[*].message ← history fallback
+ *
+ * Token counts may also appear at the top level (studioResult.input_tokens) when
+ * output_preview is absent.
+ */
+export function extractAnswerAndUsage(studioResult) {
+  const preview = studioResult?.output_preview || {};
+  let answer = "";
+  let thinkingFromResult = null;
+
+  // ── A: top-level answer (most common with Claude-based agents) ──────────
+  // In some cases (e.g. when the agent makes a nested tool call) Relevance AI
+  // serialises the full output_preview as a JSON string in the answer field.
+  // We unwrap it: if the value itself is a JSON object, look for .answer/.text
+  // inside before falling back to using the whole string.
+  if (studioResult?.answer) {
+    const rawAnswer = String(studioResult.answer);
+    answer = unwrapStructuredAnswerText(rawAnswer);
+    if (rawAnswer.trim().startsWith("{") || rawAnswer.trim().startsWith("[")) {
+      try {
+        const inner = JSON.parse(rawAnswer);
+        if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+          // Opportunistically extract thinking from nested validation_history
+          const vh = Array.isArray(inner.validation_history) ? inner.validation_history : [];
+          if (!thinkingFromResult && vh.length) {
+            const lastAi = [...vh].reverse().find((h) => h?.role === "ai");
+            if (lastAi && Array.isArray(lastAi.thinking) && lastAi.thinking.length) {
+              thinkingFromResult = lastAi.thinking
+                .filter((t) => t && typeof t.text === "string")
+                .map((t) => t.text)
+                .join("\n\n");
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // ── B: output_preview.answer ────────────────────────────────────────────
+  if (!answer && preview.answer) {
+    answer = unwrapStructuredAnswerText(String(preview.answer));
+  }
+
+  // ── C: output_preview.message (may be a JSON blob) ──────────────────────
+  if (!answer && preview.message) {
+    const rawPreviewMessage = String(preview.message);
+    answer = unwrapStructuredAnswerText(rawPreviewMessage);
+    try {
+      const parsed = JSON.parse(rawPreviewMessage);
+      if (Array.isArray(parsed.thinking) && parsed.thinking.length) {
+        thinkingFromResult = parsed.thinking
+          .filter((t) => t && typeof t === "object" && typeof t.text === "string")
+          .map((t) => t.text)
+          .join("\n\n");
+      }
+    } catch {}
+  }
+
+  // ── D: validation_history / history_items fallback ──────────────────────
   if (!answer) {
-    const historyItems = preview.history_items || [];
+    const historyItems =
+      preview.history_items ||
+      preview.validation_history ||
+      studioResult?.validation_history ||
+      [];
     const aiMessages = historyItems
       .filter((item) => item?.role === "ai")
-      .map((item) => item?.message || "")
+      .map((item) => {
+        if (typeof item.message !== "string") return "";
+        const unwrappedMessage = unwrapStructuredAnswerText(item.message);
+        if (unwrappedMessage !== item.message) {
+          return unwrappedMessage;
+        }
+        // The message field itself might be a JSON blob
+        try {
+          const p = JSON.parse(item.message);
+          if (p.text || p.answer) {
+            if (!thinkingFromResult && Array.isArray(p.thinking) && p.thinking.length) {
+              thinkingFromResult = p.thinking
+                .filter((t) => t && typeof t.text === "string")
+                .map((t) => t.text)
+                .join("\n\n");
+            }
+            return p.answer || p.text || "";
+          }
+        } catch { /* plain text */ }
+        return item.message;
+      })
       .filter(Boolean);
     answer = aiMessages.at(-1) || "";
   }
 
-  let promptTokens = preview.input_tokens;
-  let completionTokens = preview.output_tokens;
+  // ── Thinking: always scan validation_history for thinking blocks ─────────
+  // Do this regardless of which path provided the answer, because thinking
+  // lives in validation_history[*].thinking even when answer came from A/B/C.
+  if (!thinkingFromResult) {
+    const historyForThinking =
+      preview.history_items ||
+      preview.validation_history ||
+      studioResult?.validation_history ||
+      [];
+    const lastAi = [...historyForThinking].reverse().find((item) => item?.role === "ai");
+    if (lastAi) {
+      // Dedicated thinking array on the history item
+      if (Array.isArray(lastAi.thinking) && lastAi.thinking.length) {
+        thinkingFromResult = lastAi.thinking
+          .filter((t) => t && typeof t === "object" && typeof t.text === "string")
+          .map((t) => t.text)
+          .join("\n\n");
+      }
+      // Or thinking embedded in the message JSON blob
+      if (!thinkingFromResult && typeof lastAi.message === "string") {
+        try {
+          const p = JSON.parse(lastAi.message);
+          if (Array.isArray(p.thinking) && p.thinking.length) {
+            thinkingFromResult = p.thinking
+              .filter((t) => t && typeof t.text === "string")
+              .map((t) => t.text)
+              .join("\n\n");
+          }
+        } catch { /* not JSON */ }
+      }
+    }
+  }
+
+  // ── Token counts ─────────────────────────────────────────────────────────
+  // May live in output_preview, at the top level, or in trace_info.
+  let promptTokens = preview.input_tokens ?? studioResult?.input_tokens ?? null;
+  let completionTokens = preview.output_tokens ?? studioResult?.output_tokens ?? null;
   let totalTokens = null;
 
   const traceUsage = preview.trace_info?.usage || {};
-  if (promptTokens == null) promptTokens = traceUsage.input_tokens;
-  if (completionTokens == null) completionTokens = traceUsage.output_tokens;
-  if (totalTokens == null) totalTokens = traceUsage.total_tokens;
+  if (promptTokens == null) promptTokens = traceUsage.input_tokens ?? null;
+  if (completionTokens == null) completionTokens = traceUsage.output_tokens ?? null;
+  if (totalTokens == null) totalTokens = traceUsage.total_tokens ?? null;
 
   const creditsUsed = Array.isArray(studioResult?.credits_used)
     ? studioResult.credits_used.filter((item) => item && typeof item === "object")
@@ -206,6 +447,7 @@ export function extractAnswerAndUsage(studioResult) {
 
   return {
     answer: answer || "",
+    thinking: thinkingFromResult || null,
     usage: {
       prompt_tokens: Number(promptTokens || 0),
       completion_tokens: Number(completionTokens || 0),
@@ -254,6 +496,9 @@ export function extractTaskViewProgress(viewPayload) {
 
   return {
     thinking,
-    text: typeof latestAgentMessage.text === "string" ? latestAgentMessage.text : "",
+    text:
+      typeof latestAgentMessage.text === "string"
+        ? unwrapStructuredAnswerText(latestAgentMessage.text)
+        : "",
   };
 }
