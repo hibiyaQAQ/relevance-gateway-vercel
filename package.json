@@ -1,0 +1,16 @@
+{
+  "name": "relevance-gateway-lab",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@relevanceai/sdk": "^3.1.0",
+    "better-sqlite3": "^11.8.1",
+    "cookie": "^1.0.2",
+    "express": "^4.21.2"
+  }
+}

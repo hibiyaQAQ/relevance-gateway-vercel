@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply text-slate-900 antialiased selection:bg-emerald-100 selection:text-emerald-900;
+  }
+
+  input, textarea {
+    @apply focus:outline-none transition-all duration-200;
+  }
+}
+
+@layer components {
+  .input {
+    @apply w-full rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm transition-all placeholder:text-slate-400 hover:border-slate-300 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10;
+  }
+
+  /* Improved spacing for tables */
+  table {
+    @apply border-collapse;
+  }
+
+  /* Custom scrollbar for better density feel */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-slate-200 hover:bg-slate-300;
+  }
+}
+
+/* Fix for space-y in portals - though portals are at body root, 
+   this ensures they don't inherit weird spacing if somehow nested */
+.fixed.inset-0 {
+  margin-top: 0 !important;
+}
+
+/* Animations */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.3s ease-out;
+}
+
+/* Improved typography for a "control panel" look */
+.font-black {
+  letter-spacing: -0.02em;
+}
+
+.tracking-widest {
+  letter-spacing: 0.1em;
+}
