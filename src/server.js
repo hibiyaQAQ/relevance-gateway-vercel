@@ -53,11 +53,72 @@ import {
   createAnthropicStreamWriter,
 } from "./anthropic-format.js";
 
-const db = await openDatabase(settings.databasePath);
 const app = express();
+let dbPromise = null;
+
+async function getDatabase() {
+  if (!dbPromise) {
+    dbPromise = openDatabase(settings.databasePath).catch((error) => {
+      dbPromise = null;
+      throw error;
+    });
+  }
+  return await dbPromise;
+}
+
+const db = {
+  prepare(sql) {
+    return {
+      async get(...args) {
+        return await (await getDatabase()).prepare(sql).get(...args);
+      },
+      async all(...args) {
+        return await (await getDatabase()).prepare(sql).all(...args);
+      },
+      async run(...args) {
+        return await (await getDatabase()).prepare(sql).run(...args);
+      },
+    };
+  },
+  async exec(sql) {
+    return await (await getDatabase()).exec(sql);
+  },
+  async batch(statements, mode) {
+    return await (await getDatabase()).batch(statements, mode);
+  },
+  async close() {
+    if (!dbPromise) return;
+    const database = await dbPromise;
+    dbPromise = null;
+    await database.close();
+  },
+};
+
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve()
+      .then(() => handler(req, res, next))
+      .catch(next);
+  };
+}
 
 app.use(express.json({ limit: "4mb" }));
 app.use(express.static(publicDir));
+
+for (const method of ["get", "post", "patch", "delete"]) {
+  const original = app[method].bind(app);
+  app[method] = (routePath, ...handlers) => {
+    if (!handlers.length) return original(routePath);
+    return original(
+      routePath,
+      ...handlers.map((handler) =>
+        typeof handler === "function" && handler.constructor.name === "AsyncFunction"
+          ? asyncHandler(handler)
+          : handler,
+      ),
+    );
+  };
+}
 
 function requireAdmin(req, res) {
   const cookies = cookie.parse(req.headers.cookie || "");
@@ -235,7 +296,8 @@ app.get("/", (_req, res) => {
   res.redirect("/admin");
 });
 
-app.get("/healthz", (_req, res) => {
+app.get("/healthz", async (_req, res) => {
+  await getDatabase();
   res.json({ status: "ok" });
 });
 
@@ -1393,6 +1455,22 @@ async function listDeploymentsForKey(upstreamKeyId) {
     )
     .all(upstreamKeyId);
 }
+
+app.use((error, _req, res, _next) => {
+  console.error("request failed %s", formatErrorForLog(error));
+  if (res.headersSent) {
+    return;
+  }
+  const statusCode =
+    Number.isFinite(Number(error?.statusCode)) && Number(error?.statusCode) >= 400
+      ? Number(error.statusCode)
+      : Number.isFinite(Number(error?.status)) && Number(error?.status) >= 400
+        ? Number(error.status)
+        : 500;
+  res.status(statusCode).json({
+    detail: statusCode >= 500 ? "Internal server error." : String(error?.message || error),
+  });
+});
 
 export default app;
 
