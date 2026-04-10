@@ -1256,12 +1256,12 @@ app.post("/v1/messages", async (req, res) => {
           if (toolCall) {
             const toolCallId = generateToolUseId();
             writer.emitToolUseBlock(toolCallId, toolCall.name, toolCall.input, idx++);
-            writer.finish("tool_use", result.usage?.completion_tokens || 0);
+            writer.finish("tool_use", result.usage);
           } else {
             const tb = writer.openTextBlock(idx++);
             if (result.content) tb.delta(result.content);
             tb.close();
-            writer.finish("end_turn", result.usage?.completion_tokens || 0);
+            writer.finish("end_turn", result.usage);
           }
         } else {
           // Progressive mode — close any open blocks and finish
@@ -1278,7 +1278,7 @@ app.post("/v1/messages", async (req, res) => {
             const tb = writer.openTextBlock(blockIndex);
             tb.close();
           }
-          writer.finish("end_turn", result.usage?.completion_tokens || 0);
+          writer.finish("end_turn", result.usage);
         }
       }
     } catch (error) {

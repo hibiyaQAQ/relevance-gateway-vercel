@@ -332,11 +332,18 @@ export function createAnthropicStreamWriter(res, requestId, model, inputTokens) 
     /**
      * Close the stream with a stop_reason.
      */
-    finish(stopReason, outputTokens) {
+    finish(stopReason, usageOrOutputTokens) {
+      const usage =
+        usageOrOutputTokens && typeof usageOrOutputTokens === "object"
+          ? usageOrOutputTokens
+          : { completion_tokens: usageOrOutputTokens || 0 };
       write(sseEvent("message_delta", {
         type: "message_delta",
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: outputTokens || 0 },
+        usage: {
+          input_tokens: usage?.prompt_tokens || 0,
+          output_tokens: usage?.completion_tokens || 0,
+        },
       }));
       write(sseRaw("message_stop", '{"type":"message_stop"}'));
       if (!closed) res.end();
