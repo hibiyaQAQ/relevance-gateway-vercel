@@ -83,11 +83,35 @@ function splitSqlStatements(sql) {
 
 function normalizeRow(row) {
   if (!row || typeof row !== "object") return row;
-  return Object.fromEntries(Object.entries(row));
+  return Object.fromEntries(
+    Object.entries(row).map(([key, value]) => [key, normalizeFieldValue(key, value)]),
+  );
 }
 
 function normalizeRows(rows) {
   return Array.isArray(rows) ? rows.map(normalizeRow) : [];
+}
+
+function shouldCoerceIntegerField(key) {
+  return /(^id$|_id$|^enabled$|^stream$|^count$|_count$|_tokens$|_ms$|_chars$|^consecutive_failures$)/.test(key);
+}
+
+function normalizeFieldValue(key, value) {
+  if (typeof value === "bigint") {
+    const normalized = Number(value);
+    return Number.isSafeInteger(normalized) ? normalized : value.toString();
+  }
+
+  if (
+    typeof value === "string" &&
+    shouldCoerceIntegerField(key) &&
+    /^-?\d+$/.test(value.trim())
+  ) {
+    const normalized = Number(value);
+    return Number.isSafeInteger(normalized) ? normalized : value;
+  }
+
+  return value;
 }
 
 function coerceRowId(value) {
@@ -758,6 +782,15 @@ export async function openDatabase(databasePath) {
 }
 
 export function normalizeBool(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "bigint") return value !== 0n;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return false;
+    if (["0", "false", "f", "no", "off"].includes(normalized)) return false;
+    if (["1", "true", "t", "yes", "on"].includes(normalized)) return true;
+  }
   return Boolean(value);
 }
 
