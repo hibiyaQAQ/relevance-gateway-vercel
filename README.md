@@ -272,3 +272,7 @@ python3 scripts/self_test.py
 ├── docker-compose.yml  # Docker 启动配置
 └── README.md
 ```
+
+## 致谢
+
+本项目在 [LINUX DO](https://linux.do/) 社区推广，感谢 LINUX DO 社区对开源项目的支持与认可。
