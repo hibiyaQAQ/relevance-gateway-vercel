@@ -7,8 +7,8 @@ const __dirname = path.dirname(__filename);
 
 export const projectRoot = path.resolve(__dirname, "..");
 export const dataDir = path.join(projectRoot, "data");
-export const staticDir = path.join(projectRoot, "static");
-export const adminStaticDir = path.join(staticDir, "admin");
+export const publicDir = path.join(projectRoot, "public");
+export const adminStaticDir = path.join(publicDir, "admin");
 export const adminAssetsDir = path.join(adminStaticDir, "assets");
 
 function readBool(name, fallback) {
@@ -18,17 +18,28 @@ function readBool(name, fallback) {
 }
 
 function parseDatabasePath(value) {
-  if (!value) return path.join(dataDir, "gateway.db");
+  if (!value) return `file:${path.join(dataDir, "gateway.db")}`;
+  if (
+    value.startsWith("file:") ||
+    value.startsWith("libsql:") ||
+    value.startsWith("http://") ||
+    value.startsWith("https://") ||
+    value.startsWith("postgres://") ||
+    value.startsWith("postgresql://")
+  ) {
+    return value;
+  }
   if (value.startsWith("sqlite:////")) {
-    return value.slice("sqlite:///".length);
+    return `file:${value.slice("sqlite:///".length)}`;
   }
   if (value.startsWith("sqlite:///")) {
     const relativePath = value.slice("sqlite:///".length);
-    return path.isAbsolute(relativePath)
+    const absolutePath = path.isAbsolute(relativePath)
       ? relativePath
       : path.join(projectRoot, relativePath);
+    return `file:${absolutePath}`;
   }
-  return value;
+  return `file:${value}`;
 }
 
 export const settings = {
@@ -36,7 +47,11 @@ export const settings = {
   appSecretKey: process.env.APP_SECRET_KEY || "change-me-super-secret",
   adminUsername: process.env.ADMIN_USERNAME || "admin",
   adminPassword: process.env.ADMIN_PASSWORD || "admin",
-  databasePath: parseDatabasePath(process.env.DATABASE_URL),
+  databasePath: parseDatabasePath(
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRES_URL_NON_POOLING,
+  ),
   adminCookieName: process.env.ADMIN_COOKIE_NAME || "rg_admin_session",
   adminCookieTtlSeconds: Number(process.env.ADMIN_COOKIE_TTL_SECONDS || 60 * 60 * 24 * 7),
   upstreamPollIntervalSeconds: Number(process.env.UPSTREAM_POLL_INTERVAL_SECONDS || 1.5),
@@ -80,3 +95,4 @@ export const settings = {
 };
 
 fs.mkdirSync(dataDir, { recursive: true });
+fs.mkdirSync(publicDir, { recursive: true });

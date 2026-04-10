@@ -3,7 +3,7 @@ import path from "node:path";
 import cookie from "cookie";
 import express from "express";
 
-import { adminStaticDir, settings, staticDir } from "./config.js";
+import { adminStaticDir, publicDir, settings } from "./config.js";
 import { openDatabase } from "./db.js";
 import { formatErrorForLog } from "./error-utils.js";
 import { runAgentTask } from "./runtime.js";
@@ -53,11 +53,11 @@ import {
   createAnthropicStreamWriter,
 } from "./anthropic-format.js";
 
-const db = openDatabase(settings.databasePath);
+const db = await openDatabase(settings.databasePath);
 const app = express();
 
 app.use(express.json({ limit: "4mb" }));
-app.use("/static", express.static(staticDir));
+app.use(express.static(publicDir));
 
 function requireAdmin(req, res) {
   const cookies = cookie.parse(req.headers.cookie || "");
@@ -69,13 +69,13 @@ function requireAdmin(req, res) {
   return username;
 }
 
-function requireGatewayKey(req, res) {
+async function requireGatewayKey(req, res) {
   // Support both "Authorization: Bearer <key>" (OpenAI style)
   // and "x-api-key: <key>" (Anthropic style)
   const rawKey =
     readBearerToken(req.headers.authorization) ||
     (req.headers["x-api-key"] ? String(req.headers["x-api-key"]).trim() : null);
-  const gatewayKey = authenticateGatewayKey(db, rawKey);
+  const gatewayKey = await authenticateGatewayKey(db, rawKey);
   if (!gatewayKey) {
     res.status(401).json({ detail: "Invalid gateway API key." });
     return null;
@@ -269,15 +269,15 @@ app.post("/admin-api/logout", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/admin-api/bootstrap", (req, res) => {
+app.get("/admin-api/bootstrap", async (req, res) => {
   if (!requireAdmin(req, res)) return;
-  res.json(getBootstrapData(db));
+  res.json(await getBootstrapData(db));
 });
 
-app.get("/admin-api/request-logs", (req, res) => {
+app.get("/admin-api/request-logs", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   res.json(
-    listRequestLogsPage(db, {
+    await listRequestLogsPage(db, {
       page: req.query.page,
       pageSize: req.query.page_size,
     }),
@@ -299,7 +299,7 @@ app.patch("/admin-api/upstream-keys/:upstreamKeyId", async (req, res) => {
   try {
     const item = await updateUpstreamKey(db, Number(req.params.upstreamKeyId), req.body || {});
     res.json({
-      upstream_key: serializeUpstreamKey(item, listDeploymentsForKey(item.id)),
+      upstream_key: serializeUpstreamKey(item, await listDeploymentsForKey(item.id)),
     });
   } catch (error) {
     res.status(400).json({ detail: String(error.message || error) });
@@ -310,10 +310,10 @@ app.post("/admin-api/upstream-keys/:upstreamKeyId/verify", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
     const result = await verifyUpstreamKey(db, Number(req.params.upstreamKeyId));
-    const item = db
+    const item = await db
       .prepare("SELECT * FROM upstream_keys WHERE id = ?")
       .get(Number(req.params.upstreamKeyId));
-    res.json({ result, upstream_key: serializeUpstreamKey(item, listDeploymentsForKey(item.id)) });
+    res.json({ result, upstream_key: serializeUpstreamKey(item, await listDeploymentsForKey(item.id)) });
   } catch (error) {
     res.status(502).json({ detail: String(error.message || error) });
   }
@@ -322,12 +322,12 @@ app.post("/admin-api/upstream-keys/:upstreamKeyId/verify", async (req, res) => {
 app.get("/admin-api/model-catalog", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   const upstreamKeyId = req.query.upstream_key_id ? Number(req.query.upstream_key_id) : null;
-  const sourceKey = pickCatalogSourceKey(db, upstreamKeyId);
+  const sourceKey = await pickCatalogSourceKey(db, upstreamKeyId);
   if (!sourceKey) {
     return res.status(404).json({ detail: "No enabled upstream key is available." });
   }
   try {
-    let cache = findModelCatalogCache(db, {
+    let cache = await findModelCatalogCache(db, {
       project: sourceKey.project,
       region: sourceKey.region,
       modelSubset: "AGENT",
@@ -337,7 +337,7 @@ app.get("/admin-api/model-catalog", async (req, res) => {
     }
     res.json({
       catalog: serializeModelCatalog(cache),
-      source_upstream_key: serializeUpstreamKey(sourceKey, listDeploymentsForKey(sourceKey.id)),
+      source_upstream_key: serializeUpstreamKey(sourceKey, await listDeploymentsForKey(sourceKey.id)),
     });
   } catch (error) {
     res.status(502).json({ detail: String(error.message || error) });
@@ -347,7 +347,7 @@ app.get("/admin-api/model-catalog", async (req, res) => {
 app.post("/admin-api/model-catalog/refresh", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   const upstreamKeyId = req.query.upstream_key_id ? Number(req.query.upstream_key_id) : null;
-  const sourceKey = pickCatalogSourceKey(db, upstreamKeyId);
+  const sourceKey = await pickCatalogSourceKey(db, upstreamKeyId);
   if (!sourceKey) {
     return res.status(404).json({ detail: "No enabled upstream key is available." });
   }
@@ -355,10 +355,10 @@ app.post("/admin-api/model-catalog/refresh", async (req, res) => {
     const cache = await refreshModelCatalog(db, sourceKey);
     res.json({
       catalog: serializeModelCatalog(cache),
-      source_upstream_key: serializeUpstreamKey(sourceKey, listDeploymentsForKey(sourceKey.id)),
+      source_upstream_key: serializeUpstreamKey(sourceKey, await listDeploymentsForKey(sourceKey.id)),
     });
   } catch (error) {
-    const cache = findModelCatalogCache(db, {
+    const cache = await findModelCatalogCache(db, {
       project: sourceKey.project,
       region: sourceKey.region,
       modelSubset: "AGENT",
@@ -368,21 +368,21 @@ app.post("/admin-api/model-catalog/refresh", async (req, res) => {
     }
     res.json({
       catalog: serializeModelCatalog(cache),
-      source_upstream_key: serializeUpstreamKey(sourceKey, listDeploymentsForKey(sourceKey.id)),
+      source_upstream_key: serializeUpstreamKey(sourceKey, await listDeploymentsForKey(sourceKey.id)),
       warning: String(error.message || error),
     });
   }
 });
 
-app.get("/admin-api/upstream-keys/:upstreamKeyId/deployments", (req, res) => {
+app.get("/admin-api/upstream-keys/:upstreamKeyId/deployments", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   const upstreamKeyId = Number(req.params.upstreamKeyId);
-  const upstreamKey = db.prepare("SELECT * FROM upstream_keys WHERE id = ?").get(upstreamKeyId);
+  const upstreamKey = await db.prepare("SELECT * FROM upstream_keys WHERE id = ?").get(upstreamKeyId);
   if (!upstreamKey) {
     return res.status(404).json({ detail: "Upstream key not found." });
   }
   res.json({
-    deployments: listDeploymentsForKey(upstreamKeyId).map(serializeDeployment),
+    deployments: (await listDeploymentsForKey(upstreamKeyId)).map(serializeDeployment),
   });
 });
 
@@ -494,10 +494,10 @@ app.delete("/admin-api/upstream-keys/:upstreamKeyId", async (req, res) => {
   }
 });
 
-app.post("/admin-api/gateway-keys", (req, res) => {
+app.post("/admin-api/gateway-keys", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
-    const result = createGatewayApiKey(db, req.body || {});
+    const result = await createGatewayApiKey(db, req.body || {});
     res.json({
       gateway_key: serializeGatewayKey(result.gatewayKey),
       raw_key: result.rawKey,
@@ -507,19 +507,19 @@ app.post("/admin-api/gateway-keys", (req, res) => {
   }
 });
 
-app.delete("/admin-api/gateway-keys/:gatewayKeyId", (req, res) => {
+app.delete("/admin-api/gateway-keys/:gatewayKeyId", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
-    const result = deleteGatewayApiKey(db, Number(req.params.gatewayKeyId));
+    const result = await deleteGatewayApiKey(db, Number(req.params.gatewayKeyId));
     res.json(result);
   } catch (error) {
     res.status(404).json({ detail: String(error.message || error) });
   }
 });
 
-app.get("/v1/models", (req, res) => {
-  if (!requireGatewayKey(req, res)) return;
-  const rows = db
+app.get("/v1/models", async (req, res) => {
+  if (!(await requireGatewayKey(req, res))) return;
+  const rows = await db
     .prepare(
       `
         SELECT public_model_name, display_name
@@ -546,7 +546,7 @@ app.get("/v1/models", (req, res) => {
 });
 
 app.post("/v1/chat/completions", async (req, res) => {
-  const gatewayKey = requireGatewayKey(req, res);
+  const gatewayKey = await requireGatewayKey(req, res);
   if (!gatewayKey) return;
 
   let chatRequest;
@@ -559,7 +559,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     });
   }
 
-  const deployment = selectDeploymentForModel(db, chatRequest.model);
+  const deployment = await selectDeploymentForModel(db, chatRequest.model);
   if (!deployment) {
     return errorResponse(res, {
       message: `No active deployment is available for model '${chatRequest.model}'.`,
@@ -590,7 +590,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 
   const prompt = buildPrompt(resolvedMessages, { tools: chatRequest.tools });
-  const requestId = beginGatewayRequest(db, {
+  const requestId = await beginGatewayRequest(db, {
     deployment,
     gatewayKeyName: gatewayKey.name,
     stream: chatRequest.stream,
@@ -774,7 +774,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       );
     }
 
-    markRequestStreaming(db, requestId);
+    await markRequestStreaming(db, requestId);
 
     const heartbeat = setInterval(() => {
       if (!closed) {
@@ -794,7 +794,7 @@ app.post("/v1/chat/completions", async (req, res) => {
         abortSignal: abortController.signal,
         onTaskCreated: (conversationId) => {
           upstreamConversationId = conversationId;
-          markRequestStreaming(db, requestId, conversationId);
+          void markRequestStreaming(db, requestId, conversationId);
         },
         // When tools are present, suppress progressive streaming so we can inspect
         // the full response for tool-call JSON before emitting anything.
@@ -832,7 +832,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 
       clearInterval(heartbeat);
       if (watchdogHandle) clearInterval(watchdogHandle);
-      completeGatewayRequest(db, {
+      await completeGatewayRequest(db, {
         requestId,
         deploymentId: deployment.id,
         conversationId: result.conversationId || upstreamConversationId,
@@ -965,7 +965,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     } catch (error) {
       clearInterval(heartbeat);
       if (watchdogHandle) clearInterval(watchdogHandle);
-      failGatewayRequest(db, {
+      await failGatewayRequest(db, {
         requestId,
         deploymentId: deployment.id,
         conversationId: upstreamConversationId,
@@ -1003,7 +1003,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       },
     });
 
-    completeGatewayRequest(db, {
+    await completeGatewayRequest(db, {
       requestId,
       deploymentId: deployment.id,
       conversationId: result.conversationId || upstreamConversationId,
@@ -1069,7 +1069,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       }),
     );
   } catch (error) {
-    failGatewayRequest(db, {
+    await failGatewayRequest(db, {
       requestId,
       deploymentId: deployment.id,
       conversationId: upstreamConversationId,
@@ -1096,7 +1096,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 // ---------------------------------------------------------------------------
 
 app.post("/v1/messages", async (req, res) => {
-  const gatewayKey = requireGatewayKey(req, res);
+  const gatewayKey = await requireGatewayKey(req, res);
   if (!gatewayKey) return;
 
   let anthropicReq;
@@ -1109,7 +1109,7 @@ app.post("/v1/messages", async (req, res) => {
     });
   }
 
-  const deployment = selectDeploymentForModel(db, anthropicReq.model);
+  const deployment = await selectDeploymentForModel(db, anthropicReq.model);
   if (!deployment) {
     return res.status(503).json({
       type: "error",
@@ -1144,7 +1144,7 @@ app.post("/v1/messages", async (req, res) => {
     tools: anthropicReq.tools,
     systemPrompt: anthropicReq.systemPrompt,
   });
-  const requestId = beginGatewayRequest(db, {
+  const requestId = await beginGatewayRequest(db, {
     deployment,
     gatewayKeyName: gatewayKey.name,
     stream: anthropicReq.stream,
@@ -1179,7 +1179,7 @@ app.post("/v1/messages", async (req, res) => {
     });
     res.flushHeaders?.();
 
-    markRequestStreaming(db, requestId);
+    await markRequestStreaming(db, requestId);
 
     const writer = createAnthropicStreamWriter(res, requestId, anthropicReq.model, 0);
 
@@ -1203,7 +1203,7 @@ app.post("/v1/messages", async (req, res) => {
         abortSignal: abortController.signal,
         onTaskCreated: (conversationId) => {
           upstreamConversationId = conversationId;
-          markRequestStreaming(db, requestId, conversationId);
+          void markRequestStreaming(db, requestId, conversationId);
         },
         onThinking: hasTool ? null : (delta) => {
           if (writer.closed() || !delta) return;
@@ -1229,7 +1229,7 @@ app.post("/v1/messages", async (req, res) => {
 
       clearInterval(heartbeat);
 
-      completeGatewayRequest(db, {
+      await completeGatewayRequest(db, {
         requestId,
         deploymentId: deployment.id,
         conversationId: result.conversationId || upstreamConversationId,
@@ -1283,7 +1283,7 @@ app.post("/v1/messages", async (req, res) => {
       }
     } catch (error) {
       clearInterval(heartbeat);
-      failGatewayRequest(db, {
+      await failGatewayRequest(db, {
         requestId,
         deploymentId: deployment.id,
         conversationId: upstreamConversationId,
@@ -1319,7 +1319,7 @@ app.post("/v1/messages", async (req, res) => {
       },
     });
 
-    completeGatewayRequest(db, {
+    await completeGatewayRequest(db, {
       requestId,
       deploymentId: deployment.id,
       conversationId: result.conversationId || upstreamConversationId,
@@ -1364,7 +1364,7 @@ app.post("/v1/messages", async (req, res) => {
         }),
       );
   } catch (error) {
-    failGatewayRequest(db, {
+    await failGatewayRequest(db, {
       requestId,
       deploymentId: deployment.id,
       conversationId: upstreamConversationId,
@@ -1386,26 +1386,30 @@ app.post("/v1/messages", async (req, res) => {
   }
 });
 
-function listDeploymentsForKey(upstreamKeyId) {
-  return db
+async function listDeploymentsForKey(upstreamKeyId) {
+  return await db
     .prepare(
       "SELECT * FROM model_deployments WHERE upstream_key_id = ? ORDER BY display_name COLLATE NOCASE ASC, id ASC",
     )
     .all(upstreamKeyId);
 }
 
-app.listen(settings.port, settings.host, () => {
-  console.info(
-    "gateway listening on http://%s:%s using Node.js SDK runtime",
-    settings.host,
-    settings.port,
-  );
-  if (settings.debugRuntime) {
+export default app;
+
+if (!process.env.VERCEL) {
+  app.listen(settings.port, settings.host, () => {
     console.info(
-      "debug runtime enabled payloads=%s stall_warning_seconds=%s watchdog_interval_seconds=%s",
-      settings.debugStreamPayloads,
-      settings.debugStreamStallWarningSeconds,
-      settings.debugStreamWatchdogIntervalSeconds,
+      "gateway listening on http://%s:%s using Node.js SDK runtime",
+      settings.host,
+      settings.port,
     );
-  }
-});
+    if (settings.debugRuntime) {
+      console.info(
+        "debug runtime enabled payloads=%s stall_warning_seconds=%s watchdog_interval_seconds=%s",
+        settings.debugStreamPayloads,
+        settings.debugStreamStallWarningSeconds,
+        settings.debugStreamWatchdogIntervalSeconds,
+      );
+    }
+  });
+}

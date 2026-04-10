@@ -1,0 +1,51 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 300
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/v1/(.*)",
+      "destination": "/api"
+    },
+    {
+      "source": "/admin-api/(.*)",
+      "destination": "/api"
+    },
+    {
+      "source": "/healthz",
+      "destination": "/api"
+    },
+    {
+      "source": "/admin",
+      "destination": "/admin/index.html"
+    },
+    {
+      "source": "/admin/",
+      "destination": "/admin/index.html"
+    },
+    {
+      "source": "/admin/dashboard",
+      "destination": "/admin/index.html"
+    },
+    {
+      "source": "/admin/upstream",
+      "destination": "/admin/index.html"
+    },
+    {
+      "source": "/admin/gateway",
+      "destination": "/admin/index.html"
+    },
+    {
+      "source": "/admin/logs",
+      "destination": "/admin/index.html"
+    },
+    {
+      "source": "/",
+      "destination": "/api"
+    }
+  ]
+}

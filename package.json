@@ -4,13 +4,15 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "build": "npm --prefix frontend install && npm --prefix frontend run build",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js"
   },
   "dependencies": {
+    "@libsql/client": "^0.15.15",
     "@relevanceai/sdk": "^3.1.0",
-    "better-sqlite3": "^11.8.1",
     "cookie": "^1.0.2",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "postgres": "^3.4.7"
   }
 }

@@ -37,8 +37,8 @@ function getMaterial(upstreamKey) {
   };
 }
 
-function listDeploymentsForUpstreamKey(db, upstreamKeyId) {
-  return db
+async function listDeploymentsForUpstreamKey(db, upstreamKeyId) {
+  return await db
     .prepare(
       `
         SELECT *
@@ -50,18 +50,18 @@ function listDeploymentsForUpstreamKey(db, upstreamKeyId) {
     .all(upstreamKeyId);
 }
 
-function getUpstreamKey(db, upstreamKeyId) {
-  return db.prepare("SELECT * FROM upstream_keys WHERE id = ?").get(upstreamKeyId) || null;
+async function getUpstreamKey(db, upstreamKeyId) {
+  return await db.prepare("SELECT * FROM upstream_keys WHERE id = ?").get(upstreamKeyId) || null;
 }
 
-function getGatewayKey(db, gatewayKeyId) {
-  return db
+async function getGatewayKey(db, gatewayKeyId) {
+  return await db
     .prepare("SELECT * FROM gateway_api_keys WHERE id = ?")
     .get(gatewayKeyId) || null;
 }
 
-function getDeployment(db, deploymentId) {
-  return db
+async function getDeployment(db, deploymentId) {
+  return await db
     .prepare(
       `
         SELECT d.*, u.project, u.region, u.api_key, u.name AS upstream_key_name, u.enabled AS upstream_key_enabled
@@ -368,20 +368,23 @@ export function buildPrompt(messages, { tools = null, systemPrompt = null } = {}
   return lines.join("\n");
 }
 
-export function getBootstrapData(db) {
-  const upstreamKeys = db
+export async function getBootstrapData(db) {
+  const upstreamKeyRows = await db
     .prepare("SELECT * FROM upstream_keys ORDER BY id ASC")
-    .all()
-    .map((row) => serializeUpstreamKey(row, listDeploymentsForUpstreamKey(db, row.id)));
+    .all();
+  const upstreamKeys = await Promise.all(
+    upstreamKeyRows.map(async (row) =>
+      serializeUpstreamKey(row, await listDeploymentsForUpstreamKey(db, row.id))),
+  );
 
-  const gatewayKeys = db
+  const gatewayKeys = (await db
     .prepare("SELECT * FROM gateway_api_keys ORDER BY id ASC")
-    .all()
+    .all())
     .map(serializeGatewayKey);
 
-  const requestLogs = db
+  const requestLogs = (await db
     .prepare("SELECT * FROM request_logs ORDER BY created_at DESC, id DESC LIMIT 50")
-    .all()
+    .all())
     .map(serializeRequestLog);
 
   return {
@@ -396,15 +399,16 @@ export function getBootstrapData(db) {
   };
 }
 
-export function listRequestLogsPage(db, { page, pageSize }) {
+export async function listRequestLogsPage(db, { page, pageSize }) {
   const pagination = normalizePagination({
     page,
     pageSize,
     defaultPageSize: 20,
     maxPageSize: 100,
   });
-  const total = db.prepare("SELECT COUNT(*) AS count FROM request_logs").get().count;
-  const items = db
+  const totalRow = await db.prepare("SELECT COUNT(*) AS count FROM request_logs").get();
+  const total = totalRow?.count || 0;
+  const items = (await db
     .prepare(
       `
         SELECT *
@@ -413,16 +417,16 @@ export function listRequestLogsPage(db, { page, pageSize }) {
         LIMIT ? OFFSET ?
       `,
     )
-    .all(pagination.pageSize, pagination.offset)
+    .all(pagination.pageSize, pagination.offset))
     .map(serializeRequestLog);
 
   return buildPaginatedResponse(items, total, pagination.page, pagination.pageSize);
 }
 
-export function authenticateGatewayKey(db, rawKey) {
+export async function authenticateGatewayKey(db, rawKey) {
   if (!rawKey) return null;
   return (
-    db
+    await db
       .prepare(
         "SELECT * FROM gateway_api_keys WHERE raw_key = ? AND enabled = 1",
       )
@@ -453,8 +457,9 @@ export async function createUpstreamKey(db, payload) {
   const statement = db.prepare(`
     INSERT INTO upstream_keys(name, project, region, api_key, enabled, status, last_error, last_check_at, created_at, updated_at)
     VALUES (@name, @project, @region, @api_key, 1, @status, NULL, @last_check_at, @created_at, @updated_at)
+    RETURNING id
   `);
-  const info = statement.run({
+  const info = await statement.run({
     name: payload.name.trim(),
     project: payload.project.trim(),
     region: payload.region.trim(),
@@ -464,11 +469,11 @@ export async function createUpstreamKey(db, payload) {
     created_at: now,
     updated_at: now,
   });
-  return getUpstreamKey(db, Number(info.lastInsertRowid));
+  return await getUpstreamKey(db, Number(info.lastInsertRowid));
 }
 
 export async function updateUpstreamKey(db, upstreamKeyId, payload) {
-  const current = getUpstreamKey(db, upstreamKeyId);
+  const current = await getUpstreamKey(db, upstreamKeyId);
   if (!current) {
     throw new Error("Upstream key not found.");
   }
@@ -502,7 +507,7 @@ export async function updateUpstreamKey(db, upstreamKeyId, payload) {
     lastCheckAt = nowUtc();
   }
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE upstream_keys
     SET name = @name,
         project = @project,
@@ -527,11 +532,11 @@ export async function updateUpstreamKey(db, upstreamKeyId, payload) {
     updated_at: nowUtc(),
   });
 
-  return getUpstreamKey(db, upstreamKeyId);
+  return await getUpstreamKey(db, upstreamKeyId);
 }
 
 export async function verifyUpstreamKey(db, upstreamKeyId) {
-  const upstreamKey = getUpstreamKey(db, upstreamKeyId);
+  const upstreamKey = await getUpstreamKey(db, upstreamKeyId);
   if (!upstreamKey) {
     throw new Error("Upstream key not found.");
   }
@@ -540,7 +545,7 @@ export async function verifyUpstreamKey(db, upstreamKeyId) {
     const client = new RelevanceRestClient(getMaterial(upstreamKey));
     const agents = await client.listAgents();
     const now = nowUtc();
-    db.prepare(`
+    await db.prepare(`
       UPDATE upstream_keys
       SET status = 'active',
           last_error = NULL,
@@ -555,7 +560,7 @@ export async function verifyUpstreamKey(db, upstreamKeyId) {
     return { status: "active", agent_count: agents.length };
   } catch (error) {
     const now = nowUtc();
-    db.prepare(`
+    await db.prepare(`
       UPDATE upstream_keys
       SET status = 'invalid',
           last_error = @last_error,
@@ -572,9 +577,9 @@ export async function verifyUpstreamKey(db, upstreamKeyId) {
   }
 }
 
-export function findModelCatalogCache(db, { project, region, modelSubset = "AGENT" }) {
+export async function findModelCatalogCache(db, { project, region, modelSubset = "AGENT" }) {
   const row =
-    db
+    await db
       .prepare(
         `
           SELECT *
@@ -586,13 +591,13 @@ export function findModelCatalogCache(db, { project, region, modelSubset = "AGEN
   return row;
 }
 
-export function pickCatalogSourceKey(db, upstreamKeyId = null) {
+export async function pickCatalogSourceKey(db, upstreamKeyId = null) {
   if (upstreamKeyId != null) {
-    const key = getUpstreamKey(db, upstreamKeyId);
+    const key = await getUpstreamKey(db, upstreamKeyId);
     return key && normalizeBool(key.enabled) ? key : null;
   }
 
-  const keys = db
+  const keys = await db
     .prepare("SELECT * FROM upstream_keys WHERE enabled = 1 ORDER BY id ASC")
     .all();
   if (!keys.length) return null;
@@ -607,7 +612,7 @@ export async function refreshModelCatalog(db, upstreamKey) {
     settings.modelCatalogRefreshTimeoutSeconds,
   );
   const models = await client.listAgentModels("AGENT");
-  const existing = findModelCatalogCache(db, {
+  const existing = await findModelCatalogCache(db, {
     project: upstreamKey.project,
     region: upstreamKey.region,
     modelSubset: "AGENT",
@@ -615,7 +620,7 @@ export async function refreshModelCatalog(db, upstreamKey) {
   const now = nowUtc();
 
   if (existing) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE model_catalog_cache
       SET source_upstream_key_id = @source_upstream_key_id,
           source_upstream_key_name = @source_upstream_key_name,
@@ -634,14 +639,14 @@ export async function refreshModelCatalog(db, upstreamKey) {
       last_refreshed_at: now,
       updated_at: now,
     });
-    return findModelCatalogCache(db, {
+    return await findModelCatalogCache(db, {
       project: upstreamKey.project,
       region: upstreamKey.region,
       modelSubset: "AGENT",
     });
   }
 
-  const info = db.prepare(`
+  const info = await db.prepare(`
     INSERT INTO model_catalog_cache(
       project,
       region,
@@ -668,6 +673,7 @@ export async function refreshModelCatalog(db, upstreamKey) {
       @created_at,
       @updated_at
     )
+    RETURNING id
   `).run({
     project: upstreamKey.project,
     region: upstreamKey.region,
@@ -680,7 +686,7 @@ export async function refreshModelCatalog(db, upstreamKey) {
     updated_at: now,
   });
 
-  return db.prepare("SELECT * FROM model_catalog_cache WHERE id = ?").get(info.lastInsertRowid);
+  return await db.prepare("SELECT * FROM model_catalog_cache WHERE id = ?").get(info.lastInsertRowid);
 }
 
 function findMatchingCatalogModel(models, upstreamModel) {
@@ -696,7 +702,7 @@ export async function resolveModelIdentity(db, upstreamKey, upstreamModel) {
   const normalized = String(upstreamModel || "").trim();
   if (!normalized) throw new Error("Upstream model is required.");
 
-  let cache = findModelCatalogCache(db, {
+  let cache = await findModelCatalogCache(db, {
     project: upstreamKey.project,
     region: upstreamKey.region,
     modelSubset: "AGENT",
@@ -721,11 +727,11 @@ export async function resolveModelIdentity(db, upstreamKey, upstreamModel) {
   };
 }
 
-export function ensureNoConflictingDeploymentDefinition(
+export async function ensureNoConflictingDeploymentDefinition(
   db,
   { publicModelName, upstreamModel, excludeDeploymentId = null },
 ) {
-  const rows = db
+  const rows = await db
     .prepare(
       "SELECT * FROM model_deployments WHERE public_model_name = ? ORDER BY id ASC",
     )
@@ -786,16 +792,16 @@ async function createOrUpdateUpstreamAgent({
 }
 
 export async function createDeployment(db, upstreamKeyId, payload) {
-  const upstreamKey = getUpstreamKey(db, upstreamKeyId);
+  const upstreamKey = await getUpstreamKey(db, upstreamKeyId);
   if (!upstreamKey) throw new Error("Upstream key not found.");
 
   const values = await resolveModelIdentity(db, upstreamKey, payload.upstream_model);
-  ensureNoConflictingDeploymentDefinition(db, {
+  await ensureNoConflictingDeploymentDefinition(db, {
     publicModelName: values.public_model_name,
     upstreamModel: values.upstream_model,
   });
 
-  const existing = db
+  const existing = await db
     .prepare(
       `
         SELECT *
@@ -819,7 +825,7 @@ export async function createDeployment(db, upstreamKeyId, payload) {
   });
 
   const now = nowUtc();
-  const info = db.prepare(`
+  const info = await db.prepare(`
     INSERT INTO model_deployments(
       upstream_key_id,
       public_model_name,
@@ -854,6 +860,7 @@ export async function createDeployment(db, upstreamKeyId, payload) {
       @created_at,
       @updated_at
     )
+    RETURNING id
   `).run({
     upstream_key_id: upstreamKey.id,
     public_model_name: values.public_model_name,
@@ -865,11 +872,11 @@ export async function createDeployment(db, upstreamKeyId, payload) {
     updated_at: now,
   });
 
-  return getDeployment(db, Number(info.lastInsertRowid));
+  return await getDeployment(db, Number(info.lastInsertRowid));
 }
 
 export async function createDeploymentsBatch(db, upstreamKeyId, upstreamModels) {
-  const upstreamKey = getUpstreamKey(db, upstreamKeyId);
+  const upstreamKey = await getUpstreamKey(db, upstreamKeyId);
   if (!upstreamKey) throw new Error("Upstream key not found.");
 
   const created = [];
@@ -882,7 +889,7 @@ export async function createDeploymentsBatch(db, upstreamKeyId, upstreamModels) 
     if (!upstreamModel || seen.has(upstreamModel)) continue;
     seen.add(upstreamModel);
 
-    const existing = db
+    const existing = await db
       .prepare(
         `
           SELECT *
@@ -918,19 +925,19 @@ export async function createDeploymentsBatch(db, upstreamKeyId, upstreamModels) 
 }
 
 export async function updateDeployment(db, upstreamKeyId, deploymentId, payload) {
-  const deployment = getDeployment(db, deploymentId);
+  const deployment = await getDeployment(db, deploymentId);
   if (!deployment || deployment.upstream_key_id !== upstreamKeyId) {
     throw new Error("Deployment not found.");
   }
 
-  const upstreamKey = getUpstreamKey(db, deployment.upstream_key_id);
+  const upstreamKey = await getUpstreamKey(db, deployment.upstream_key_id);
   const nextValues = await resolveModelIdentity(
     db,
     upstreamKey,
     payload.upstream_model || deployment.upstream_model,
   );
 
-  ensureNoConflictingDeploymentDefinition(db, {
+  await ensureNoConflictingDeploymentDefinition(db, {
     publicModelName: nextValues.public_model_name,
     upstreamModel: nextValues.upstream_model,
     excludeDeploymentId: deployment.id,
@@ -953,7 +960,7 @@ export async function updateDeployment(db, upstreamKeyId, deploymentId, payload)
     });
   }
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE model_deployments
     SET public_model_name = @public_model_name,
         display_name = @display_name,
@@ -970,11 +977,11 @@ export async function updateDeployment(db, upstreamKeyId, deploymentId, payload)
     updated_at: nowUtc(),
   });
 
-  return getDeployment(db, deployment.id);
+  return await getDeployment(db, deployment.id);
 }
 
 export async function deleteDeployment(db, upstreamKeyId, deploymentId) {
-  const deployment = getDeployment(db, deploymentId);
+  const deployment = await getDeployment(db, deploymentId);
   if (!deployment || deployment.upstream_key_id !== upstreamKeyId) {
     throw new Error("Deployment not found.");
   }
@@ -987,22 +994,22 @@ export async function deleteDeployment(db, upstreamKeyId, deploymentId) {
     warnings.push(`Failed to delete upstream agent ${deployment.agent_id}: ${error.message || error}`);
   }
 
-  db.prepare("DELETE FROM model_deployments WHERE id = ?").run(deployment.id);
+  await db.prepare("DELETE FROM model_deployments WHERE id = ?").run(deployment.id);
   return { deleted: true, warnings };
 }
 
 export async function deleteUpstreamKey(db, upstreamKeyId) {
-  const upstreamKey = getUpstreamKey(db, upstreamKeyId);
+  const upstreamKey = await getUpstreamKey(db, upstreamKeyId);
   if (!upstreamKey) throw new Error("Upstream key not found.");
 
-  const deployments = listDeploymentsForUpstreamKey(db, upstreamKeyId);
+  const deployments = await listDeploymentsForUpstreamKey(db, upstreamKeyId);
   const warnings = [];
   for (const deployment of deployments) {
     const result = await deleteDeployment(db, upstreamKeyId, deployment.id);
     warnings.push(...(result.warnings || []));
   }
 
-  db.prepare("DELETE FROM upstream_keys WHERE id = ?").run(upstreamKeyId);
+  await db.prepare("DELETE FROM upstream_keys WHERE id = ?").run(upstreamKeyId);
   return { deleted: true, warnings };
 }
 
@@ -1011,17 +1018,17 @@ export async function syncDeploymentsToKeys(
   sourceUpstreamKeyId,
   { target_upstream_key_ids = [], public_model_names = [] },
 ) {
-  const sourceKey = getUpstreamKey(db, sourceUpstreamKeyId);
+  const sourceKey = await getUpstreamKey(db, sourceUpstreamKeyId);
   if (!sourceKey) throw new Error("Source upstream key not found.");
 
   const targetIds = target_upstream_key_ids.length
     ? target_upstream_key_ids
-    : db
+    : (await db
         .prepare("SELECT id FROM upstream_keys WHERE id != ? ORDER BY id ASC")
         .all(sourceUpstreamKeyId)
-        .map((item) => item.id);
+        .map((item) => item.id));
 
-  let sourceDeployments = listDeploymentsForUpstreamKey(db, sourceUpstreamKeyId);
+  let sourceDeployments = await listDeploymentsForUpstreamKey(db, sourceUpstreamKeyId);
   if (public_model_names.length) {
     const allowed = new Set(public_model_names);
     sourceDeployments = sourceDeployments.filter((item) => allowed.has(item.public_model_name));
@@ -1032,11 +1039,11 @@ export async function syncDeploymentsToKeys(
   const failed = [];
 
   for (const targetId of targetIds) {
-    const targetKey = getUpstreamKey(db, targetId);
+    const targetKey = await getUpstreamKey(db, targetId);
     if (!targetKey || targetKey.id === sourceKey.id) continue;
 
     for (const sourceDeployment of sourceDeployments) {
-      const existing = db
+      const existing = await db
         .prepare(
           `
             SELECT *
@@ -1079,22 +1086,22 @@ export async function syncDeploymentsToKeys(
   return { created, skipped, failed };
 }
 
-export function listUpstreamAgents(db, upstreamKeyId) {
-  const upstreamKey = getUpstreamKey(db, upstreamKeyId);
+export async function listUpstreamAgents(db, upstreamKeyId) {
+  const upstreamKey = await getUpstreamKey(db, upstreamKeyId);
   if (!upstreamKey) throw new Error("Upstream key not found.");
   return { upstreamKey };
 }
 
 export async function fetchUpstreamAgents(db, upstreamKeyId) {
-  const upstreamKey = getUpstreamKey(db, upstreamKeyId);
+  const upstreamKey = await getUpstreamKey(db, upstreamKeyId);
   if (!upstreamKey) throw new Error("Upstream key not found.");
 
   const client = new RelevanceRestClient(getMaterial(upstreamKey));
   const agents = await client.listAgents();
-  const deployments = db.prepare("SELECT * FROM model_deployments").all();
+  const deployments = await db.prepare("SELECT * FROM model_deployments").all();
   const deploymentByAgentId = new Map(deployments.map((item) => [item.agent_id, item]));
   const keyById = new Map(
-    db.prepare("SELECT id, name FROM upstream_keys ORDER BY id ASC").all().map((item) => [item.id, item.name]),
+    (await db.prepare("SELECT id, name FROM upstream_keys ORDER BY id ASC").all()).map((item) => [item.id, item.name]),
   );
 
   const items = agents
@@ -1129,21 +1136,21 @@ export async function fetchUpstreamAgents(db, upstreamKeyId) {
 }
 
 export async function deleteUpstreamAgents(db, upstreamKeyId, agentIds) {
-  const upstreamKey = getUpstreamKey(db, upstreamKeyId);
+  const upstreamKey = await getUpstreamKey(db, upstreamKeyId);
   if (!upstreamKey) throw new Error("Upstream key not found.");
 
   const client = new RelevanceRestClient(getMaterial(upstreamKey));
   const deleted = [];
   const failed = [];
   const lookup = new Map(
-    db
+    (await db
       .prepare(
         "SELECT * FROM model_deployments WHERE agent_id IN (" +
           agentIds.map(() => "?").join(",") +
           ")",
       )
       .all(...agentIds)
-      .map((item) => [item.agent_id, item]),
+      .map((item) => [item.agent_id, item])),
   );
 
   for (const agentId of agentIds) {
@@ -1151,7 +1158,7 @@ export async function deleteUpstreamAgents(db, upstreamKeyId, agentIds) {
     try {
       await client.deleteAgent(agentId);
       if (deployment) {
-        db.prepare("DELETE FROM model_deployments WHERE id = ?").run(deployment.id);
+        await db.prepare("DELETE FROM model_deployments WHERE id = ?").run(deployment.id);
       }
       deleted.push({
         agent_id: agentId,
@@ -1166,28 +1173,29 @@ export async function deleteUpstreamAgents(db, upstreamKeyId, agentIds) {
   return { deleted, failed };
 }
 
-export function createGatewayApiKey(db, payload) {
+export async function createGatewayApiKey(db, payload) {
   const rawKey = generateGatewayKey();
   const now = nowUtc();
-  const info = db.prepare(`
+  const info = await db.prepare(`
     INSERT INTO gateway_api_keys(name, raw_key, enabled, created_at)
     VALUES (?, ?, 1, ?)
+    RETURNING id
   `).run(payload.name.trim(), rawKey, now);
   return {
-    gatewayKey: getGatewayKey(db, Number(info.lastInsertRowid)),
+    gatewayKey: await getGatewayKey(db, Number(info.lastInsertRowid)),
     rawKey,
   };
 }
 
-export function deleteGatewayApiKey(db, gatewayKeyId) {
-  const key = getGatewayKey(db, gatewayKeyId);
+export async function deleteGatewayApiKey(db, gatewayKeyId) {
+  const key = await getGatewayKey(db, gatewayKeyId);
   if (!key) throw new Error("Gateway API key not found.");
-  db.prepare("DELETE FROM gateway_api_keys WHERE id = ?").run(gatewayKeyId);
+  await db.prepare("DELETE FROM gateway_api_keys WHERE id = ?").run(gatewayKeyId);
   return { deleted: true };
 }
 
-export function selectDeploymentForModel(db, publicModelName) {
-  const selected = db
+export async function selectDeploymentForModel(db, publicModelName) {
+  const selected = await db
     .prepare(
       `
         SELECT d.*, u.project, u.region, u.api_key, u.name AS upstream_key_name, u.enabled AS upstream_key_enabled
@@ -1201,21 +1209,21 @@ export function selectDeploymentForModel(db, publicModelName) {
           CASE WHEN d.last_used_at IS NOT NULL THEN 1 ELSE 0 END ASC,
           d.last_used_at ASC,
           d.id ASC
-      `,
+  `,
     )
     .get(publicModelName);
   if (!selected) return null;
 
-  db.prepare(
+  await db.prepare(
     "UPDATE model_deployments SET last_used_at = ?, updated_at = ? WHERE id = ?",
   ).run(nowUtc(), nowUtc(), selected.id);
 
-  return getDeployment(db, selected.id);
+  return await getDeployment(db, selected.id);
 }
 
-export function beginGatewayRequest(db, { deployment, gatewayKeyName, stream, prompt }) {
+export async function beginGatewayRequest(db, { deployment, gatewayKeyName, stream, prompt }) {
   const requestId = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO request_logs(
       request_id,
       gateway_key_name,
@@ -1239,8 +1247,8 @@ export function beginGatewayRequest(db, { deployment, gatewayKeyName, stream, pr
   return requestId;
 }
 
-export function markRequestStreaming(db, requestId, conversationId = null) {
-  db.prepare(`
+export async function markRequestStreaming(db, requestId, conversationId = null) {
+  await db.prepare(`
     UPDATE request_logs
     SET status = 'streaming',
         upstream_conversation_id = COALESCE(?, upstream_conversation_id)
@@ -1248,7 +1256,7 @@ export function markRequestStreaming(db, requestId, conversationId = null) {
   `).run(conversationId, requestId);
 }
 
-export function completeGatewayRequest(
+export async function completeGatewayRequest(
   db,
   {
     requestId,
@@ -1266,9 +1274,9 @@ export function completeGatewayRequest(
     emittedThinkingChars,
   },
 ) {
-  const deployment = getDeployment(db, deploymentId);
+  const deployment = await getDeployment(db, deploymentId);
   if (deployment) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE model_deployments
       SET last_latency_ms = ?,
           last_error = NULL,
@@ -1279,7 +1287,7 @@ export function completeGatewayRequest(
     `).run(latencyMs, nowUtc(), deploymentId);
   }
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE request_logs
     SET status = 'completed',
         latency_ms = @latency_ms,
@@ -1315,7 +1323,7 @@ export function completeGatewayRequest(
   });
 }
 
-export function failGatewayRequest(
+export async function failGatewayRequest(
   db,
   {
     requestId,
@@ -1325,9 +1333,9 @@ export function failGatewayRequest(
     errorMessage,
   },
 ) {
-  const deployment = getDeployment(db, deploymentId);
+  const deployment = await getDeployment(db, deploymentId);
   if (deployment) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE model_deployments
       SET consecutive_failures = consecutive_failures + 1,
           last_error = ?,
@@ -1337,7 +1345,7 @@ export function failGatewayRequest(
     `).run(String(errorMessage), nowUtc(), deploymentId);
   }
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE request_logs
     SET status = 'failed',
         transport = COALESCE(@transport, transport),
@@ -1352,21 +1360,21 @@ export function failGatewayRequest(
   });
 }
 
-export function serializeForAdmin(db, type, id) {
+export async function serializeForAdmin(db, type, id) {
   if (type === "upstream-key") {
-    const row = getUpstreamKey(db, id);
-    return row ? serializeUpstreamKey(row, listDeploymentsForUpstreamKey(db, row.id)) : null;
+    const row = await getUpstreamKey(db, id);
+    return row ? serializeUpstreamKey(row, await listDeploymentsForUpstreamKey(db, row.id)) : null;
   }
   if (type === "deployment") {
-    const row = getDeployment(db, id);
+    const row = await getDeployment(db, id);
     return row ? serializeDeployment(row) : null;
   }
   if (type === "gateway-key") {
-    const row = getGatewayKey(db, id);
+    const row = await getGatewayKey(db, id);
     return row ? serializeGatewayKey(row) : null;
   }
   if (type === "catalog") {
-    const row = db.prepare("SELECT * FROM model_catalog_cache WHERE id = ?").get(id);
+    const row = await db.prepare("SELECT * FROM model_catalog_cache WHERE id = ?").get(id);
     return row ? serializeModelCatalog(row) : null;
   }
   return null;
